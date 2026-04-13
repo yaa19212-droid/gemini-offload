@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gemini-offload-mcp"
+version = "0.1.0"
+description = "Thin stdio MCP server that offloads Gemini subtasks (OCR / STT / text) for orchestrator agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "mcp>=1.0",
+    "google-genai>=0.3",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+gemini-offload-mcp = "mcp_server:main"
+
+[tool.setuptools.packages.find]
+include = ["mcp_server*"]
