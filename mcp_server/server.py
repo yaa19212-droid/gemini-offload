@@ -27,6 +27,35 @@ INLINE_PREVIEW_CHARS = 300
 FILE_PREVIEW_CHARS = 100
 
 
+def _load_system_prompt(inline: Any, path: Any) -> Any:
+    if path is None:
+        return inline
+    if inline is not None:
+        raise ValueError("Pass either system_prompt or system_prompt_path, not both.")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("system_prompt_path must be a non-empty string.")
+    p = pathlib.Path(path)
+    if not p.is_absolute():
+        raise ValueError(f"system_prompt_path must be absolute: {path}")
+    return p.read_text(encoding="utf-8")
+
+
+def _load_history(inline: Any, path: Any) -> Any:
+    if path is None:
+        return inline
+    if inline:
+        raise ValueError("Pass either history or history_path, not both.")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("history_path must be a non-empty string.")
+    p = pathlib.Path(path)
+    if not p.is_absolute():
+        raise ValueError(f"history_path must be absolute: {path}")
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("history_path file must contain a JSON array of {role, text} objects.")
+    return data
+
+
 def _apply_output_policy(result: dict[str, Any], output_path: Any) -> dict[str, Any]:
     full_text: str = result.pop("text", "") or ""
     char_count = len(full_text)
@@ -76,7 +105,10 @@ def _tool_definitions() -> list[mcp_types.Tool]:
                 "to disk and only a 100-char head preview is returned inline. "
                 "If `output_path` is omitted the response is truncated to the first 300 chars "
                 "(full text is NOT recoverable from the inline response in that case) — "
-                "omit only for small one-off calls."
+                "omit only for small one-off calls. "
+                "Calls are processed sequentially over stdio — batching multiple calls in one "
+                "message does NOT parallelize. Issue calls one at a time and verify each "
+                "result's quality before continuing to the next."
             ),
             inputSchema={
                 "type": "object",
@@ -98,7 +130,7 @@ def _tool_definitions() -> list[mcp_types.Tool]:
                     "model": {
                         "type": "string",
                         "description": "Gemini model name.",
-                        "default": "gemini-2.5-flash",
+                        "default": "gemini-3.1-pro-preview",
                     },
                     "include_thinking": {
                         "type": "boolean",
@@ -118,6 +150,21 @@ def _tool_definitions() -> list[mcp_types.Tool]:
                             "additionalProperties": False,
                         },
                         "default": [],
+                    },
+                    "system_prompt_path": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path to a UTF-8 text file whose contents are used as the "
+                            "system prompt. Mutually exclusive with `system_prompt`. Use this for "
+                            "large or repeated prompts to avoid resending the text on every call."
+                        ),
+                    },
+                    "history_path": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path to a JSON file containing a list of {role, text} "
+                            "few-shot turns. Mutually exclusive with `history`."
+                        ),
                     },
                     "output_path": {
                         "type": "string",
@@ -196,7 +243,13 @@ def _tool_definitions() -> list[mcp_types.Tool]:
 server = Server(
     SERVER_NAME,
     version=SERVER_VERSION,
-    instructions="Thin stdio MCP wrapper for Gemini file uploads and generate_content calls.",
+    instructions=(
+        "Thin stdio MCP wrapper for Gemini file uploads and generate_content calls. "
+        "NOTE: This server processes tool calls sequentially over a single stdio channel — "
+        "issuing multiple `gemini_generate` calls in one message does NOT run them in parallel. "
+        "Call sequentially and inspect each result before issuing the next so quality issues "
+        "are caught early instead of amplified across a batch."
+    ),
 )
 
 
@@ -211,14 +264,18 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None):
 
     try:
         if name == "gemini_generate":
+            system_prompt = _load_system_prompt(
+                args.get("system_prompt"), args.get("system_prompt_path")
+            )
+            history = _load_history(args.get("history"), args.get("history_path"))
             result = await anyio.to_thread.run_sync(
                 generate,
                 args["prompt"],
                 args.get("files"),
-                args.get("system_prompt"),
-                args.get("model", "gemini-2.5-flash"),
+                system_prompt,
+                args.get("model", "gemini-3.1-pro-preview"),
                 args.get("include_thinking", False),
-                args.get("history"),
+                history,
             )
             return _wrap_result(_apply_output_policy(result, args.get("output_path")))
 

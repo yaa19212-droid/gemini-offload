@@ -15,7 +15,7 @@ from google.genai import types
 from .keys import get_next_api_key
 
 
-DEFAULT_MODEL_NAME = "gemini-2.5-flash"
+DEFAULT_MODEL_NAME = "gemini-3.1-pro-preview"
 
 AVAILABLE_MODELS = [
     "gemini-3.1-pro-preview",
