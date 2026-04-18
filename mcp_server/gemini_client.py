@@ -17,17 +17,32 @@ from .keys import get_next_api_key
 
 DEFAULT_MODEL_NAME = "gemini-3.1-pro-preview"
 
-AVAILABLE_MODELS = [
-    "gemini-3.1-pro-preview",
-    "gemini-3-pro-preview",
-    "gemini-3.0-pro",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-preview-09-2025",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash-lite-preview-09-2025",
-    "gemini-2.5-flash-image",
-]
+
+@dataclass(frozen=True)
+class ModelSpec:
+    supports_thinking: bool = True
+    supports_image_output: bool = False
+
+
+MODEL_SPECS: dict[str, ModelSpec] = {
+    "gemini-3.1-pro-preview": ModelSpec(),
+    "gemini-3-flash-preview": ModelSpec(),
+    "gemini-3.1-flash-lite-preview": ModelSpec(),
+    "gemini-3.1-flash-image-preview": ModelSpec(
+        supports_thinking=False,
+        supports_image_output=True,
+    ),
+    "gemini-3-pro-image-preview": ModelSpec(supports_image_output=True),
+    "gemini-2.5-pro": ModelSpec(),
+    "gemini-2.5-flash": ModelSpec(),
+    "gemini-2.5-flash-lite": ModelSpec(),
+    "gemini-2.5-flash-image": ModelSpec(
+        supports_thinking=False,
+        supports_image_output=True,
+    ),
+}
+
+AVAILABLE_MODELS = list(MODEL_SPECS)
 
 MIME_TYPE_MAP = {
     ".pdf": "application/pdf",
@@ -169,19 +184,49 @@ def _extract_response_model(response, requested_model: str) -> str:
 
 
 def _extract_response_text(response) -> str:
-    """Extract text from API response, excluding thinking parts."""
+    payload = _extract_response_payload(response)
+    return payload["text"]
+
+
+def _iter_response_parts(response) -> list[Any]:
+    parts = getattr(response, "parts", None)
+    if parts:
+        return list(parts)
+
+    candidates = getattr(response, "candidates", None) or []
+    if candidates:
+        candidate = candidates[0]
+        content = getattr(candidate, "content", None)
+        candidate_parts = getattr(content, "parts", None) or []
+        return list(candidate_parts)
+
+    return []
+
+
+def _extract_response_payload(response) -> dict[str, Any]:
+    """Extract text and image parts from the API response."""
 
     answer_parts: list[str] = []
+    images: list[dict[str, Any]] = []
 
     try:
-        if hasattr(response, "candidates") and len(response.candidates) > 0:
-            candidate = response.candidates[0]
-            if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
-                parts = candidate.content.parts or []
-                for part in parts:
-                    part_text = getattr(part, "text", None)
-                    if isinstance(part_text, str) and part_text and not getattr(part, "thought", False):
-                        answer_parts.append(part_text)
+        for part in _iter_response_parts(response):
+            part_text = getattr(part, "text", None)
+            if isinstance(part_text, str) and part_text and not getattr(part, "thought", False):
+                answer_parts.append(part_text)
+
+            inline_data = getattr(part, "inline_data", None)
+            mime_type = getattr(inline_data, "mime_type", None)
+            image_bytes = getattr(inline_data, "data", None)
+            if isinstance(image_bytes, bytearray):
+                image_bytes = bytes(image_bytes)
+            if (
+                isinstance(mime_type, str)
+                and mime_type.startswith("image/")
+                and isinstance(image_bytes, bytes)
+                and image_bytes
+            ):
+                images.append({"mime_type": mime_type, "data": image_bytes})
 
         response_text = getattr(response, "text", None) if hasattr(response, "text") else None
         if not answer_parts and isinstance(response_text, str) and response_text:
@@ -191,11 +236,14 @@ def _extract_response_text(response) -> str:
         response_text = getattr(response, "text", None) if hasattr(response, "text") else None
         if isinstance(response_text, str) and response_text:
             answer_parts.append(response_text)
-        elif response is not None:
+        elif response is not None and not images:
             answer_parts.append(str(response))
 
     answer_text = "".join(part for part in answer_parts if isinstance(part, str)).strip()
-    return answer_text if answer_text else "[Empty response]"
+    return {
+        "text": answer_text if answer_text else "",
+        "images": images,
+    }
 
 
 def _upload_file(file_path: str, client: genai.Client):
@@ -229,17 +277,13 @@ def _call_api(
 ):
     """Call Gemini API with the prepared contents."""
 
-    if model_name.startswith("gemini-3"):
-        if include_thinking:
-            thinking_config = types.ThinkingConfig(thinking_level="HIGH")
-        else:
-            thinking_config = None
-    else:
-        thinking_config = types.ThinkingConfig(include_thoughts=include_thinking)
+    model_spec = MODEL_SPECS.get(model_name, ModelSpec())
 
     config_kwargs = {"system_instruction": system_prompt}
-    if thinking_config is not None:
-        config_kwargs["thinking_config"] = thinking_config
+    if model_spec.supports_image_output:
+        config_kwargs["response_modalities"] = ["TEXT", "IMAGE"]
+    if include_thinking and model_spec.supports_thinking:
+        config_kwargs["thinking_config"] = types.ThinkingConfig(include_thoughts=True)
 
     config = types.GenerateContentConfig(**config_kwargs)
     return client.models.generate_content(
@@ -371,10 +415,12 @@ def generate(
             include_thinking=include_thinking,
         )
     )
+    payload = _extract_response_payload(response)
 
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
     return {
-        "text": _extract_response_text(response),
+        "text": payload["text"],
+        "images": payload["images"],
         "model": _extract_response_model(response, model),
         "usage": _extract_usage(response),
         "elapsed_ms": elapsed_ms,

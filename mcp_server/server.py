@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import pathlib
 from typing import Any
 
@@ -12,7 +14,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import McpError
 
-from .gemini_client import AVAILABLE_MODELS, detect_mime, generate
+from .gemini_client import AVAILABLE_MODELS, DEFAULT_MODEL_NAME, detect_mime, generate
 
 
 SERVER_NAME = "gemini-offload"
@@ -25,6 +27,9 @@ def _raise_mcp_error(code: int, message: str, data: Any = None) -> None:
 
 INLINE_PREVIEW_CHARS = 300
 FILE_PREVIEW_CHARS = 100
+IMAGE_EXTENSION_OVERRIDES = {
+    "image/jpeg": ".jpg",
+}
 
 
 def _load_system_prompt(inline: Any, path: Any) -> Any:
@@ -58,10 +63,13 @@ def _load_history(inline: Any, path: Any) -> Any:
 
 def _apply_output_policy(result: dict[str, Any], output_path: Any) -> dict[str, Any]:
     full_text: str = result.pop("text", "") or ""
+    raw_images = result.pop("images", []) or []
     char_count = len(full_text)
-    trimmed = {k: v for k, v in result.items() if k != "text"}
+    trimmed = dict(result)
     trimmed["char_count"] = char_count
+    trimmed["image_count"] = 0
 
+    path_obj: pathlib.Path | None = None
     if output_path is not None:
         if not isinstance(output_path, str) or not output_path.strip():
             raise ValueError("output_path must be a non-empty string when provided.")
@@ -75,24 +83,85 @@ def _apply_output_policy(result: dict[str, Any], output_path: Any) -> dict[str, 
         trimmed["byte_count"] = len(encoded)
         trimmed["text_preview"] = full_text[:FILE_PREVIEW_CHARS]
         trimmed["truncated"] = char_count > FILE_PREVIEW_CHARS
-        return trimmed
+    else:
+        trimmed["text_preview"] = full_text[:INLINE_PREVIEW_CHARS]
+        trimmed["truncated"] = char_count > INLINE_PREVIEW_CHARS
 
-    trimmed["text_preview"] = full_text[:INLINE_PREVIEW_CHARS]
-    trimmed["truncated"] = char_count > INLINE_PREVIEW_CHARS
+    image_summaries: list[dict[str, Any]] = []
+    inline_images: list[dict[str, str]] = []
+    for idx, image in enumerate(raw_images, start=1):
+        mime_type = image.get("mime_type")
+        image_bytes = image.get("data")
+        if isinstance(image_bytes, bytearray):
+            image_bytes = bytes(image_bytes)
+        if not isinstance(mime_type, str) or not mime_type.startswith("image/"):
+            raise ValueError(f"Unsupported response image MIME type: {mime_type!r}")
+        if not isinstance(image_bytes, bytes) or not image_bytes:
+            raise ValueError("Response images must include non-empty bytes data.")
+
+        image_summary = {
+            "index": idx,
+            "mime_type": mime_type,
+            "byte_count": len(image_bytes),
+        }
+        if path_obj is not None:
+            image_path = _build_image_output_path(path_obj, idx, mime_type)
+            image_path.write_bytes(image_bytes)
+            image_summary["output_path"] = str(image_path)
+        else:
+            inline_images.append(
+                {
+                    "mime_type": mime_type,
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                }
+            )
+        image_summaries.append(image_summary)
+
+    trimmed["image_count"] = len(image_summaries)
+    if image_summaries:
+        trimmed["images"] = image_summaries
+    if inline_images:
+        trimmed["_inline_images"] = inline_images
     return trimmed
 
 
 def _wrap_result(result: dict[str, Any]) -> mcp_types.CallToolResult:
-    return mcp_types.CallToolResult(
-        content=[
-            mcp_types.TextContent(
-                type="text",
-                text=json.dumps(result, ensure_ascii=False, indent=2),
+    structured_content = dict(result)
+    inline_images = structured_content.pop("_inline_images", [])
+    content: list[Any] = [
+        mcp_types.TextContent(
+            type="text",
+            text=json.dumps(structured_content, ensure_ascii=False, indent=2),
+        )
+    ]
+    for image in inline_images:
+        content.append(
+            mcp_types.ImageContent(
+                type="image",
+                data=image["data"],
+                mimeType=image["mime_type"],
             )
-        ],
-        structuredContent=result,
+        )
+
+    return mcp_types.CallToolResult(
+        content=content,
+        structuredContent=structured_content,
         isError=False,
     )
+
+
+def _build_image_output_path(
+    output_path: pathlib.Path,
+    image_index: int,
+    mime_type: str,
+) -> pathlib.Path:
+    image_extension = IMAGE_EXTENSION_OVERRIDES.get(mime_type)
+    if image_extension is None:
+        image_extension = mimetypes.guess_extension(mime_type) or ".bin"
+
+    image_stem = output_path.stem if output_path.suffix else output_path.name
+    image_name = f"{image_stem}.image-{image_index}{image_extension}"
+    return output_path.with_name(image_name)
 
 
 def _tool_definitions() -> list[mcp_types.Tool]:
@@ -130,7 +199,7 @@ def _tool_definitions() -> list[mcp_types.Tool]:
                     "model": {
                         "type": "string",
                         "description": "Gemini model name.",
-                        "default": "gemini-3.1-pro-preview",
+                        "default": DEFAULT_MODEL_NAME,
                     },
                     "include_thinking": {
                         "type": "boolean",
@@ -170,7 +239,8 @@ def _tool_definitions() -> list[mcp_types.Tool]:
                         "type": "string",
                         "description": (
                             "Recommended. Absolute path to write the full UTF-8 response text. "
-                            "When set, only a 100-char head is returned inline."
+                            "If Gemini returns images, they are also written as sibling files "
+                            "next to this path and omitted from the inline MCP payload."
                         ),
                     },
                 },
@@ -184,12 +254,25 @@ def _tool_definitions() -> list[mcp_types.Tool]:
                     "usage": {"type": "object"},
                     "elapsed_ms": {"type": "integer"},
                     "char_count": {"type": "integer"},
+                    "image_count": {"type": "integer"},
                     "text_preview": {"type": "string"},
                     "truncated": {"type": "boolean"},
                     "output_path": {"type": "string"},
                     "byte_count": {"type": "integer"},
+                    "images": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                    },
                 },
-                "required": ["model", "usage", "elapsed_ms", "char_count", "text_preview", "truncated"],
+                "required": [
+                    "model",
+                    "usage",
+                    "elapsed_ms",
+                    "char_count",
+                    "image_count",
+                    "text_preview",
+                    "truncated",
+                ],
                 "additionalProperties": True,
             },
         ),
@@ -273,7 +356,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None):
                 args["prompt"],
                 args.get("files"),
                 system_prompt,
-                args.get("model", "gemini-3.1-pro-preview"),
+                args.get("model", DEFAULT_MODEL_NAME),
                 args.get("include_thinking", False),
                 history,
             )
