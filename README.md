@@ -61,6 +61,43 @@ claude mcp add gemini-offload --scope user -- python -m mcp_server
 }
 ```
 
+## Add to Codex
+
+Add a local MCP entry to `~/.codex/config.toml`.
+
+Minimal example:
+
+```toml
+[mcp_servers.gemini-offload]
+command = "python"
+args = ["-m", "mcp_server"]
+startup_timeout_sec = 1800
+tool_timeout_sec = 1800
+
+[mcp_servers.gemini-offload.env]
+GEMINI_API_KEY = "your-api-key"
+```
+
+Repo-local checkout example:
+
+```toml
+[mcp_servers.gemini-offload]
+command = "powershell"
+args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "D:/work/gemini-offload/plugins/gemini-offload/scripts/start-gemini-offload.ps1"]
+startup_timeout_sec = 1800
+tool_timeout_sec = 1800
+
+[mcp_servers.gemini-offload.env]
+GEMINI_OFFLOAD_REPO = "D:/work/gemini-offload"
+GEMINI_API_KEY = "your-api-key"
+```
+
+Notes:
+
+- `GEMINI_API_KEY` can be replaced with `GOOGLE_API_KEY`.
+- If you prefer a key file, set `GEMINI_OFFLOAD_KEYS` to a JSON file path instead of embedding the key directly.
+- After updating `config.toml`, restart Codex or open a new session so the MCP server list is reloaded.
+
 ## Tools
 
 ### `gemini_generate`
