@@ -118,6 +118,15 @@ def _load_server_module():
 
 
 class ServerOutputTests(unittest.TestCase):
+    def test_gemini_generate_tool_schema_uses_current_default_model(self) -> None:
+        server = _load_server_module()
+
+        tools = server._tool_definitions()
+        gemini_generate = next(tool for tool in tools if tool.name == "gemini_generate")
+        model_schema = gemini_generate.inputSchema["properties"]["model"]
+
+        self.assertEqual(model_schema["default"], "gemini-3.1-pro-preview")
+
     def test_inline_image_output_becomes_mcp_image_content(self) -> None:
         server = _load_server_module()
 
@@ -168,4 +177,3 @@ class ServerOutputTests(unittest.TestCase):
             self.assertEqual(image_path.read_bytes(), b"png-bytes")
             self.assertEqual(image_path.name, "response.image-1.png")
             self.assertEqual(len(wrapped.content), 1)
-

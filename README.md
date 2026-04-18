@@ -109,7 +109,7 @@ Upload local absolute-path files and run `generate_content`.
 | `prompt` | string | required |
 | `files` | string[] | optional, absolute paths |
 | `system_prompt` | string | optional |
-| `model` | string | default `gemini-2.5-flash` |
+| `model` | string | default `gemini-3.1-pro-preview` |
 | `include_thinking` | bool | default `false` |
 | `history` | `[{role, text}]` | optional few-shot turns |
 | `output_path` | string | **recommended**, absolute path |
