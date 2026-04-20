@@ -5,3 +5,5 @@ __pycache__/
 api_keys.json
 dist/
 build/
+temp/
+output/

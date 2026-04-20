@@ -55,7 +55,7 @@ def _load_from_env() -> dict[str, str]:
 
 def _parse_keys_file(path: Path) -> dict[str, str]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON in API key file: {path}") from exc
 
