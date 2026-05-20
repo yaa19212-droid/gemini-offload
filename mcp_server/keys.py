@@ -328,7 +328,7 @@ def _resolve_vertex_manifest() -> Path:
 
 
 def _load_manifest_entries(path: Path) -> list[dict[str, Any]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
     if isinstance(payload, list):
         entries = payload
     elif isinstance(payload, dict) and isinstance(payload.get("credentials"), list):
@@ -362,7 +362,7 @@ def load_vertex_credentials() -> list[VertexCredentialLease]:
         if not key_path.exists():
             raise FileNotFoundError(f"Vertex service account key not found: {key_path}")
 
-        key_payload = json.loads(key_path.read_text(encoding="utf-8"))
+        key_payload = json.loads(key_path.read_text(encoding="utf-8-sig"))
         project_id = str(entry.get("project_id") or key_payload.get("project_id") or "").strip()
         if not project_id:
             raise ValueError(f"Vertex service account key has no project_id: {key_path}")

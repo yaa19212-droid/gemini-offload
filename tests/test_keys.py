@@ -117,3 +117,31 @@ class VertexCredentialTests(unittest.TestCase):
                     result = load_vertex_credentials()
 
             self.assertEqual(result[0].project_id, "project-test")
+
+    def test_manifest_and_service_account_key_accept_utf8_bom(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            key_path = root / "key.json"
+            key_path.write_text(
+                json.dumps(
+                    {
+                        "type": "service_account",
+                        "project_id": "project-test",
+                        "client_email": "svc@example.iam.gserviceaccount.com",
+                    }
+                ),
+                encoding="utf-8-sig",
+            )
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(json.dumps([{"path": str(key_path)}]), encoding="utf-8-sig")
+
+            with patch("mcp_server.keys.service_account.Credentials.from_service_account_file") as loader:
+                fake_credentials = unittest.mock.Mock()
+                fake_credentials.with_quota_project.return_value = fake_credentials
+                loader.return_value = fake_credentials
+                with patch.dict(os.environ, {"GEMINI_OFFLOAD_VERTEX_CREDENTIALS": str(manifest_path)}, clear=False):
+                    from mcp_server.keys import load_vertex_credentials
+
+                    result = load_vertex_credentials()
+
+            self.assertEqual(result[0].project_id, "project-test")
