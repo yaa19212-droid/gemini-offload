@@ -14,7 +14,17 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import McpError
 
-from .gemini_client import AVAILABLE_MODELS, DEFAULT_MODEL_NAME, detect_mime, generate
+from .gemini_client import (
+    AVAILABLE_MODELS,
+    DEFAULT_MODEL_NAME,
+    DEFAULT_RATE_LIMIT_MAX_WAIT_SECONDS,
+    GeminiRateLimitError,
+    MODEL_CHARACTERISTICS,
+    RATE_LIMIT_MODE_FAIL_FAST,
+    detect_mime,
+    generate,
+)
+from .keys import get_key_count
 
 
 SERVER_NAME = "gemini-offload"
@@ -30,6 +40,7 @@ FILE_PREVIEW_CHARS = 100
 IMAGE_EXTENSION_OVERRIDES = {
     "image/jpeg": ".jpg",
 }
+MAX_BATCH_CONCURRENCY = 32
 
 
 def _load_system_prompt(inline: Any, path: Any) -> Any:
@@ -125,7 +136,7 @@ def _apply_output_policy(result: dict[str, Any], output_path: Any) -> dict[str, 
     return trimmed
 
 
-def _wrap_result(result: dict[str, Any]) -> mcp_types.CallToolResult:
+def _wrap_result(result: dict[str, Any], *, is_error: bool = False) -> mcp_types.CallToolResult:
     structured_content = dict(result)
     inline_images = structured_content.pop("_inline_images", [])
     content: list[Any] = [
@@ -146,7 +157,7 @@ def _wrap_result(result: dict[str, Any]) -> mcp_types.CallToolResult:
     return mcp_types.CallToolResult(
         content=content,
         structuredContent=structured_content,
-        isError=False,
+        isError=is_error,
     )
 
 
@@ -164,6 +175,106 @@ def _build_image_output_path(
     return output_path.with_name(image_name)
 
 
+def _normalize_batch_concurrency(value: Any) -> int:
+    if value is None:
+        return min(max(get_key_count(), 1), MAX_BATCH_CONCURRENCY)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("max_concurrency must be an integer.")
+    if value < 1:
+        raise ValueError("max_concurrency must be at least 1.")
+    return min(value, MAX_BATCH_CONCURRENCY)
+
+
+async def _run_generate_from_args(args: dict[str, Any]) -> dict[str, Any]:
+    system_prompt = _load_system_prompt(args.get("system_prompt"), args.get("system_prompt_path"))
+    history = _load_history(args.get("history"), args.get("history_path"))
+    result = await anyio.to_thread.run_sync(
+        generate,
+        args["prompt"],
+        args.get("files"),
+        system_prompt,
+        args.get("model", DEFAULT_MODEL_NAME),
+        args.get("include_thinking", False),
+        history,
+        args.get("rate_limit_mode", RATE_LIMIT_MODE_FAIL_FAST),
+        args.get("fallback_models"),
+        args.get("rate_limit_max_wait_seconds"),
+    )
+    return _apply_output_policy(result, args.get("output_path"))
+
+
+def _batch_job_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Optional caller-provided job id echoed in the result.",
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Required user prompt text.",
+            },
+            "files": {
+                "type": "array",
+                "description": "Optional local absolute file paths.",
+                "items": {"type": "string"},
+                "default": [],
+            },
+            "system_prompt": {"type": "string"},
+            "model": {
+                "type": "string",
+                "description": "Gemini model name.",
+                "default": DEFAULT_MODEL_NAME,
+            },
+            "include_thinking": {"type": "boolean", "default": False},
+            "history": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "role": {"type": "string"},
+                        "text": {"type": "string"},
+                    },
+                    "required": ["role", "text"],
+                    "additionalProperties": False,
+                },
+                "default": [],
+            },
+            "system_prompt_path": {"type": "string"},
+            "history_path": {"type": "string"},
+            "output_path": {
+                "type": "string",
+                "description": "Recommended absolute path for the full response text.",
+            },
+            "rate_limit_mode": {
+                "type": "string",
+                "enum": ["fail_fast", "wait"],
+                "default": RATE_LIMIT_MODE_FAIL_FAST,
+                "description": (
+                    "How to handle a cooled-down Vertex project/location/model quota slot. "
+                    "`fail_fast` returns a structured rate-limit message; `wait` waits and retries."
+                ),
+            },
+            "fallback_models": {
+                "type": "array",
+                "description": (
+                    "Optional supported model names to try only after the requested model is rate-limited."
+                ),
+                "items": {"type": "string"},
+                "default": [],
+            },
+            "rate_limit_max_wait_seconds": {
+                "type": "number",
+                "description": "Maximum cooldown wait in seconds when rate_limit_mode is `wait`.",
+                "default": DEFAULT_RATE_LIMIT_MAX_WAIT_SECONDS,
+            },
+        },
+        "required": ["prompt"],
+        "additionalProperties": False,
+    }
+
+
 def _tool_definitions() -> list[mcp_types.Tool]:
     return [
         mcp_types.Tool(
@@ -175,9 +286,8 @@ def _tool_definitions() -> list[mcp_types.Tool]:
                 "If `output_path` is omitted the response is truncated to the first 300 chars "
                 "(full text is NOT recoverable from the inline response in that case) — "
                 "omit only for small one-off calls. "
-                "Calls are processed sequentially over stdio — batching multiple calls in one "
-                "message does NOT parallelize. Issue calls one at a time and verify each "
-                "result's quality before continuing to the next."
+                "For concurrent work, use `gemini_generate_batch` with one job per artifact. "
+                "Each job should use a unique output_path."
             ),
             inputSchema={
                 "type": "object",
@@ -239,9 +349,31 @@ def _tool_definitions() -> list[mcp_types.Tool]:
                         "type": "string",
                         "description": (
                             "Recommended. Absolute path to write the full UTF-8 response text. "
-                            "If Gemini returns images, they are also written as sibling files "
-                            "next to this path and omitted from the inline MCP payload."
+                            "Non-text response parts, if any, are written as sibling files "
+                            "next to this path and kept out of the inline MCP payload."
                         ),
+                    },
+                    "rate_limit_mode": {
+                        "type": "string",
+                        "enum": ["fail_fast", "wait"],
+                        "description": (
+                            "How to handle a cooled-down Vertex project/location/model quota slot. "
+                            "`fail_fast` returns a structured rate-limit message; `wait` waits and retries."
+                        ),
+                        "default": RATE_LIMIT_MODE_FAIL_FAST,
+                    },
+                    "fallback_models": {
+                        "type": "array",
+                        "description": (
+                            "Optional supported model names to try only after the requested model is rate-limited."
+                        ),
+                        "items": {"type": "string"},
+                        "default": [],
+                    },
+                    "rate_limit_max_wait_seconds": {
+                        "type": "number",
+                        "description": "Maximum cooldown wait in seconds when rate_limit_mode is `wait`.",
+                        "default": DEFAULT_RATE_LIMIT_MAX_WAIT_SECONDS,
                     },
                 },
                 "required": ["prompt"],
@@ -277,8 +409,58 @@ def _tool_definitions() -> list[mcp_types.Tool]:
             },
         ),
         mcp_types.Tool(
+            name="gemini_generate_batch",
+            description=(
+                "Run multiple independent Gemini jobs concurrently inside this server. "
+                "Each job has the same shape as `gemini_generate` and should use a unique "
+                "`output_path`. Rate limits are tracked per Vertex project/location/model "
+                "quota slot; a 429 response cools that slot before another slot or explicit "
+                "fallback model is tried."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "jobs": {
+                        "type": "array",
+                        "items": _batch_job_schema(),
+                        "minItems": 1,
+                    },
+                    "max_concurrency": {
+                        "type": "integer",
+                        "description": (
+                            "Maximum concurrent jobs, capped at "
+                            f"{MAX_BATCH_CONCURRENCY}. Defaults to the configured Vertex credential count."
+                        ),
+                    },
+                },
+                "required": ["jobs"],
+                "additionalProperties": False,
+            },
+            outputSchema={
+                "type": "object",
+                "properties": {
+                    "job_count": {"type": "integer"},
+                    "ok_count": {"type": "integer"},
+                    "error_count": {"type": "integer"},
+                    "max_concurrency": {"type": "integer"},
+                    "results": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                    },
+                },
+                "required": [
+                    "job_count",
+                    "ok_count",
+                    "error_count",
+                    "max_concurrency",
+                    "results",
+                ],
+                "additionalProperties": False,
+            },
+        ),
+        mcp_types.Tool(
             name="list_gemini_models",
-            description="List the Gemini models supported by this server.",
+            description="List the Gemini models supported by this server with selection guidance.",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -290,9 +472,13 @@ def _tool_definitions() -> list[mcp_types.Tool]:
                     "models": {
                         "type": "array",
                         "items": {"type": "string"},
+                    },
+                    "model_characteristics": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
                     }
                 },
-                "required": ["models"],
+                "required": ["models", "model_characteristics"],
                 "additionalProperties": False,
             },
         ),
@@ -328,10 +514,8 @@ server = Server(
     version=SERVER_VERSION,
     instructions=(
         "Thin stdio MCP wrapper for Gemini file uploads and generate_content calls. "
-        "NOTE: This server processes tool calls sequentially over a single stdio channel — "
-        "issuing multiple `gemini_generate` calls in one message does NOT run them in parallel. "
-        "Call sequentially and inspect each result before issuing the next so quality issues "
-        "are caught early instead of amplified across a batch."
+        "Use `gemini_generate` for one artifact or `gemini_generate_batch` for concurrent "
+        "independent jobs. Vertex rate limits are tracked per project/location/model quota slot."
     ),
 )
 
@@ -347,23 +531,79 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None):
 
     try:
         if name == "gemini_generate":
-            system_prompt = _load_system_prompt(
-                args.get("system_prompt"), args.get("system_prompt_path")
+            return _wrap_result(await _run_generate_from_args(args))
+
+        if name == "gemini_generate_batch":
+            jobs = args.get("jobs")
+            if not isinstance(jobs, list) or not jobs:
+                raise ValueError("jobs must be a non-empty array.")
+            max_concurrency = _normalize_batch_concurrency(args.get("max_concurrency"))
+            limiter = anyio.Semaphore(max_concurrency)
+            results: list[dict[str, Any] | None] = [None] * len(jobs)
+
+            async def run_job(index: int, job_args: Any) -> None:
+                if not isinstance(job_args, dict):
+                    results[index] = {
+                        "index": index,
+                        "ok": False,
+                        "error": "ValueError: each job must be an object.",
+                    }
+                    return
+
+                async with limiter:
+                    job_id = job_args.get("id")
+                    try:
+                        job_result = await _run_generate_from_args(job_args)
+                        job_result["index"] = index
+                        job_result["ok"] = True
+                        if isinstance(job_id, str) and job_id:
+                            job_result["id"] = job_id
+                        results[index] = job_result
+                    except GeminiRateLimitError as exc:
+                        error_result = exc.to_dict()
+                        error_result.update(
+                            {
+                                "index": index,
+                                "ok": False,
+                                "error": exc.message,
+                            }
+                        )
+                        if isinstance(job_id, str) and job_id:
+                            error_result["id"] = job_id
+                        results[index] = error_result
+                    except Exception as exc:
+                        error_result = {
+                            "index": index,
+                            "ok": False,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                        if isinstance(job_id, str) and job_id:
+                            error_result["id"] = job_id
+                        results[index] = error_result
+
+            async with anyio.create_task_group() as task_group:
+                for index, job in enumerate(jobs):
+                    task_group.start_soon(run_job, index, job)
+
+            finalized_results = [result for result in results if result is not None]
+            ok_count = sum(1 for result in finalized_results if result.get("ok") is True)
+            return _wrap_result(
+                {
+                    "job_count": len(jobs),
+                    "ok_count": ok_count,
+                    "error_count": len(jobs) - ok_count,
+                    "max_concurrency": max_concurrency,
+                    "results": finalized_results,
+                }
             )
-            history = _load_history(args.get("history"), args.get("history_path"))
-            result = await anyio.to_thread.run_sync(
-                generate,
-                args["prompt"],
-                args.get("files"),
-                system_prompt,
-                args.get("model", DEFAULT_MODEL_NAME),
-                args.get("include_thinking", False),
-                history,
-            )
-            return _wrap_result(_apply_output_policy(result, args.get("output_path")))
 
         if name == "list_gemini_models":
-            return _wrap_result({"models": AVAILABLE_MODELS})
+            return _wrap_result(
+                {
+                    "models": AVAILABLE_MODELS,
+                    "model_characteristics": MODEL_CHARACTERISTICS,
+                }
+            )
 
         if name == "detect_mime":
             result = await anyio.to_thread.run_sync(detect_mime, args["path"])
@@ -371,6 +611,8 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None):
 
     except (FileNotFoundError, ValueError) as exc:
         _raise_mcp_error(mcp_types.INVALID_PARAMS, str(exc))
+    except GeminiRateLimitError as exc:
+        return _wrap_result(exc.to_dict(), is_error=True)
     except Exception as exc:
         _raise_mcp_error(mcp_types.INTERNAL_ERROR, f"{type(exc).__name__}: {exc}")
 

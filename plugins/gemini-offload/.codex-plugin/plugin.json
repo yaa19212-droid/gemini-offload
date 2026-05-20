@@ -22,7 +22,7 @@
   "interface": {
     "displayName": "Gemini Offload",
     "shortDescription": "Bounded Gemini workflows with a local MCP server",
-    "longDescription": "Use the repo-local gemini-offload MCP server plus bundled workflow guidance to offload OCR, transcription, extraction, cleanup, and image-generation subtasks without bloating the main Codex context.",
+    "longDescription": "Use the repo-local gemini-offload MCP server plus bundled workflow guidance to offload OCR, transcription, extraction, cleanup, and other bounded multimodal subtasks without bloating the main Codex context.",
     "developerName": "yaa19212-droid",
     "category": "Coding",
     "capabilities": [

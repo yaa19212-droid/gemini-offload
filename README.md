@@ -1,6 +1,6 @@
 # gemini-offload-mcp
 
-A thin stdio MCP server that wraps Google's Gemini API so an orchestrator
+A thin stdio MCP server that wraps Vertex AI Gemini so an orchestrator
 agent (Claude Code, Codex, etc.) can offload individual subtasks — OCR,
 speech-to-text, text correction, or any `generate_content` call — without
 bloating its own context.
@@ -16,22 +16,30 @@ pip install -e .
 pip install mcp google-genai httpx
 ```
 
-## API keys
+## Vertex AI credentials
 
 Resolved in this order:
 
-1. File path in `GEMINI_OFFLOAD_KEYS` env var — JSON `{ name: key }` map.
-2. `./api_keys.json` in the server's current working directory.
-3. Env vars `GEMINI_API_KEY` and/or `GOOGLE_API_KEY`.
+1. Manifest file path in `GEMINI_OFFLOAD_VERTEX_CREDENTIALS`.
+2. Manifest file path in `VERTEX_AI_CREDENTIALS`.
+3. `C:/Users/<user>/.secrets/vertex-ai/service-accounts/manifest.json`.
 
-Example `api_keys.json` (multiple keys are round-robin rotated):
+Recommended manifest:
 
 ```json
-{
-  "GOOGLE_API_KEY1": "your-api-key",
-  "GOOGLE_API_KEY2": "your-api-key"
-}
+[
+  {
+    "project_id": "my-project",
+    "client_email": "service-account@my-project.iam.gserviceaccount.com",
+    "path": "C:/path/to/vertex-ai/service-accounts/my-project-key.json"
+  }
+]
 ```
+
+Set `GOOGLE_CLOUD_LOCATION` or `VERTEX_AI_LOCATION` to override the default
+Vertex location (`global`). Rate limits are tracked per Vertex
+project/location/model quota slot and round-robin rotated across configured
+credentials.
 
 ## Run
 
@@ -55,7 +63,10 @@ claude mcp add gemini-offload --scope user -- python -m mcp_server
     "gemini-offload": {
       "command": "python",
       "args": ["-m", "mcp_server"],
-      "env": { "GEMINI_OFFLOAD_KEYS": "C:/secrets/gemini_keys.json" }
+      "env": {
+        "GEMINI_OFFLOAD_VERTEX_CREDENTIALS": "C:/path/to/vertex-ai/service-accounts/manifest.json",
+        "GOOGLE_CLOUD_LOCATION": "global"
+      }
     }
   }
 }
@@ -75,7 +86,8 @@ startup_timeout_sec = 1800
 tool_timeout_sec = 1800
 
 [mcp_servers.gemini-offload.env]
-GEMINI_API_KEY = "your-api-key"
+GEMINI_OFFLOAD_VERTEX_CREDENTIALS = "C:/path/to/vertex-ai/service-accounts/manifest.json"
+GOOGLE_CLOUD_LOCATION = "global"
 ```
 
 Repo-local checkout example:
@@ -83,19 +95,20 @@ Repo-local checkout example:
 ```toml
 [mcp_servers.gemini-offload]
 command = "powershell"
-args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "D:/work/gemini-offload/plugins/gemini-offload/scripts/start-gemini-offload.ps1"]
+args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "D:/path/to/gemini-offload/plugins/gemini-offload/scripts/start-gemini-offload.ps1"]
 startup_timeout_sec = 1800
 tool_timeout_sec = 1800
 
 [mcp_servers.gemini-offload.env]
-GEMINI_OFFLOAD_REPO = "D:/work/gemini-offload"
-GEMINI_API_KEY = "your-api-key"
+GEMINI_OFFLOAD_REPO = "D:/path/to/gemini-offload"
+GEMINI_OFFLOAD_VERTEX_CREDENTIALS = "C:/path/to/vertex-ai/service-accounts/manifest.json"
+GOOGLE_CLOUD_LOCATION = "global"
 ```
 
 Notes:
 
-- `GEMINI_API_KEY` can be replaced with `GOOGLE_API_KEY`.
-- If you prefer a key file, set `GEMINI_OFFLOAD_KEYS` to a JSON file path instead of embedding the key directly.
+- Do not set `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `GEMINI_OFFLOAD_KEYS`; those are AI Studio routes.
+- The server sends local files as inline Vertex parts and does not use the Gemini Files API.
 - After updating `config.toml`, restart Codex or open a new session so the MCP server list is reloaded.
 
 ## Tools
@@ -113,6 +126,9 @@ Upload local absolute-path files and run `generate_content`.
 | `include_thinking` | bool | default `false` |
 | `history` | `[{role, text}]` | optional few-shot turns |
 | `output_path` | string | **recommended**, absolute path |
+| `rate_limit_mode` | string | `fail_fast` default, or `wait` |
+| `fallback_models` | string[] | optional explicit fallback list |
+| `rate_limit_max_wait_seconds` | number | wait-mode cap, default `120` |
 
 **Output policy:**
 - With `output_path`: full UTF-8 text is written to disk, response returns
@@ -121,7 +137,17 @@ Upload local absolute-path files and run `generate_content`.
 
 ### `list_gemini_models`
 
-Returns the supported model list. No input.
+Returns the supported model list plus `model_characteristics`. No input.
+
+Supported models:
+
+| model | role |
+|---|---|
+| `gemini-3.1-pro-preview` | Overall best choice for complex OCR, long-context synthesis, multimodal reasoning, and difficult agentic or coding work. Use it when quality matters more than latency. |
+| `gemini-3-flash-preview` | Emergency fallback when the primary path is unavailable or too slow. It keeps Gemini 3 reasoning and multimodal coverage with Flash latency. |
+| `gemini-3.5-flash` | Fast default for throughput-sensitive jobs. It offers near-Pro agentic and coding capability at Flash speed, and can outperform 3.1 Pro in some narrower workloads. |
+
+The server intentionally rejects `gemini-2.5*` model IDs and any model not listed above.
 
 ### `detect_mime`
 
@@ -133,7 +159,38 @@ PDF, plain text / markdown / CSV, PNG/JPEG/GIF/BMP/WEBP, MP3/WAV/FLAC/OGG/M4A.
 
 ## Orchestration pattern
 
-The orchestrator agent splits a big job into N subtasks, picks distinct
-`output_path` values for each, and calls `gemini_generate` in parallel.
-Each call responds with a tiny preview payload. The orchestrator reads only
-the files it actually needs afterward.
+The orchestrator agent splits a big job into N independent subtasks, picks
+distinct `output_path` values for each, and calls `gemini_generate_batch`.
+The batch tool runs jobs concurrently, defaults concurrency to the configured
+Vertex credential count, and caps it at 32. Rate limits are tracked per
+Vertex project/location/model quota slot. If a slot returns 429, the default
+`fail_fast` mode returns a structured rate-limit result with retry and
+fallback guidance; callers may opt into `rate_limit_mode: "wait"` or provide
+explicit `fallback_models`.
+
+### `gemini_generate_batch`
+
+Run multiple independent `gemini_generate`-shaped jobs concurrently.
+
+```json
+{
+  "max_concurrency": 4,
+  "jobs": [
+    {
+      "id": "chunk-01",
+      "prompt": "OCR this file to markdown.",
+      "files": ["D:/work/in/chunk-01.pdf"],
+      "output_path": "D:/work/out/chunk-01.md"
+    },
+    {
+      "id": "chunk-02",
+      "prompt": "OCR this file to markdown.",
+      "files": ["D:/work/in/chunk-02.pdf"],
+      "output_path": "D:/work/out/chunk-02.md"
+    }
+  ]
+}
+```
+
+The result preserves input order and returns per-job `ok`, preview, usage,
+timing, output path, and error fields.

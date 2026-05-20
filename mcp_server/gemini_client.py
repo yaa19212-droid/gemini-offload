@@ -12,37 +12,107 @@ import httpx
 from google import genai
 from google.genai import types
 
-from .keys import get_next_api_key
+from .keys import (
+    DEFAULT_KEY_COOLDOWN_SECONDS,
+    ApiKeyLease,
+    NoAvailableQuotaSlotError,
+    acquire_vertex_credential_lease,
+    get_key_count,
+)
 
 
 DEFAULT_MODEL_NAME = "gemini-3.1-pro-preview"
+BLOCKED_MODEL_PREFIXES = ("gemini-2.5",)
+RATE_LIMIT_MODE_FAIL_FAST = "fail_fast"
+RATE_LIMIT_MODE_WAIT = "wait"
+RATE_LIMIT_MODES = {RATE_LIMIT_MODE_FAIL_FAST, RATE_LIMIT_MODE_WAIT}
+DEFAULT_RATE_LIMIT_MAX_WAIT_SECONDS = 120.0
 
 
 @dataclass(frozen=True)
 class ModelSpec:
     supports_thinking: bool = True
     supports_image_output: bool = False
+    description: str = ""
 
 
 MODEL_SPECS: dict[str, ModelSpec] = {
-    "gemini-3.1-pro-preview": ModelSpec(),
-    "gemini-3-flash-preview": ModelSpec(),
-    "gemini-3.1-flash-lite-preview": ModelSpec(),
-    "gemini-3.1-flash-image-preview": ModelSpec(
-        supports_thinking=False,
-        supports_image_output=True,
+    "gemini-3.1-pro-preview": ModelSpec(
+        description=(
+            "Best overall quality for complex OCR, long-context synthesis, "
+            "multimodal reasoning, and difficult agentic or coding work."
+        ),
     ),
-    "gemini-3-pro-image-preview": ModelSpec(supports_image_output=True),
-    "gemini-2.5-pro": ModelSpec(),
-    "gemini-2.5-flash": ModelSpec(),
-    "gemini-2.5-flash-lite": ModelSpec(),
-    "gemini-2.5-flash-image": ModelSpec(
-        supports_thinking=False,
-        supports_image_output=True,
+    "gemini-3-flash-preview": ModelSpec(
+        description=(
+            "Emergency fallback when the primary model is unavailable or too slow; "
+            "keeps Gemini 3 reasoning and multimodal coverage with Flash latency."
+        ),
+    ),
+    "gemini-3.5-flash": ModelSpec(
+        description=(
+            "Fast default for throughput-sensitive jobs; near-Pro agentic and coding "
+            "capability at Flash speed, and better than 3.1 Pro for some workloads."
+        ),
     ),
 }
 
 AVAILABLE_MODELS = list(MODEL_SPECS)
+MODEL_CHARACTERISTICS = {
+    model_name: spec.description for model_name, spec in MODEL_SPECS.items()
+}
+
+
+class GeminiRateLimitError(RuntimeError):
+    """Structured rate-limit failure returned to MCP callers."""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        attempted_models: list[str],
+        retry_after_seconds: float,
+        quota_slots: list[str],
+    ) -> None:
+        self.model = model
+        self.attempted_models = attempted_models
+        self.retry_after_seconds = retry_after_seconds
+        self.quota_slots = quota_slots
+        self.available_fallback_models = [
+            model_name
+            for model_name in AVAILABLE_MODELS
+            if model_name not in attempted_models
+        ]
+        super().__init__(self.message)
+
+    @property
+    def message(self) -> str:
+        fallback_note = (
+            f" Try fallback_models={self.available_fallback_models}."
+            if self.available_fallback_models
+            else ""
+        )
+        return (
+            f"Vertex quota slot for {self.model} is cooling down. "
+            f"Retry after about {self.retry_after_seconds:.1f} seconds, "
+            "or set rate_limit_mode='wait' to let the server wait before retrying."
+            f"{fallback_note}"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "error_type": "vertex_rate_limited",
+            "message": self.message,
+            "model": self.model,
+            "attempted_models": self.attempted_models,
+            "retry_after_seconds": self.retry_after_seconds,
+            "quota_slots": self.quota_slots,
+            "available_fallback_models": self.available_fallback_models,
+            "recommendation": (
+                "Retry later, set rate_limit_mode='wait', or pass fallback_models "
+                "with another supported Gemini model."
+            ),
+        }
 
 MIME_TYPE_MAP = {
     ".pdf": "application/pdf",
@@ -100,6 +170,55 @@ def sanitize_path(path: str) -> pathlib.Path:
 
 def is_supported_mime(mime_type: str) -> bool:
     return mime_type in MIME_TYPE_MAP.values()
+
+
+def _assert_allowed_model(model_name: str) -> None:
+    if any(model_name.startswith(prefix) for prefix in BLOCKED_MODEL_PREFIXES):
+        raise ValueError(
+            f"Blocked outdated Gemini model '{model_name}'. "
+            f"Use one of: {', '.join(AVAILABLE_MODELS)}."
+        )
+    if model_name not in AVAILABLE_MODELS:
+        raise ValueError(f"Unsupported model '{model_name}'. Use list_gemini_models to inspect supported models.")
+
+
+def _normalize_rate_limit_mode(value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("rate_limit_mode must be one of: fail_fast, wait.")
+    normalized = value.strip().lower()
+    if normalized not in RATE_LIMIT_MODES:
+        raise ValueError("rate_limit_mode must be one of: fail_fast, wait.")
+    return normalized
+
+
+def _normalize_rate_limit_max_wait_seconds(value: float | int | None) -> float:
+    if value is None:
+        return DEFAULT_RATE_LIMIT_MAX_WAIT_SECONDS
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("rate_limit_max_wait_seconds must be a non-negative number.")
+    if value < 0:
+        raise ValueError("rate_limit_max_wait_seconds must be a non-negative number.")
+    return float(value)
+
+
+def _normalize_model_sequence(model: str, fallback_models: list[str] | None) -> list[str]:
+    _assert_allowed_model(model)
+    sequence = [model]
+    if fallback_models is None:
+        return sequence
+    if not isinstance(fallback_models, list):
+        raise ValueError("fallback_models must be an array of supported model names.")
+
+    seen = {model}
+    for idx, fallback_model in enumerate(fallback_models, start=1):
+        if not isinstance(fallback_model, str) or not fallback_model.strip():
+            raise ValueError(f"fallback_models[{idx}] must be a non-empty string.")
+        normalized_model = fallback_model.strip()
+        _assert_allowed_model(normalized_model)
+        if normalized_model not in seen:
+            seen.add(normalized_model)
+            sequence.append(normalized_model)
+    return sequence
 
 
 def detect_mime(path: str) -> dict[str, Any]:
@@ -246,8 +365,8 @@ def _extract_response_payload(response) -> dict[str, Any]:
     }
 
 
-def _upload_file(file_path: str, client: genai.Client):
-    """Upload file to Gemini API with MIME type detection."""
+def _load_file_part(file_path: str) -> types.Part:
+    """Load a local file as an inline part for Vertex AI Gemini."""
 
     path_obj = sanitize_path(file_path)
     if not path_obj.exists():
@@ -259,13 +378,7 @@ def _upload_file(file_path: str, client: genai.Client):
     if not is_supported_mime(detected_mime):
         raise ValueError(f"Unsupported MIME type for file '{file_path}': {detected_mime}")
 
-    with open(path_obj, "rb") as file_handle:
-        uploaded_file = client.files.upload(
-            file=file_handle,
-            config=dict(mime_type=detected_mime, display_name=path_obj.name),
-        )
-
-    return uploaded_file
+    return types.Part.from_bytes(data=path_obj.read_bytes(), mime_type=detected_mime)
 
 
 def _call_api(
@@ -277,6 +390,7 @@ def _call_api(
 ):
     """Call Gemini API with the prepared contents."""
 
+    _assert_allowed_model(model_name)
     model_spec = MODEL_SPECS.get(model_name, ModelSpec())
 
     config_kwargs = {"system_instruction": system_prompt}
@@ -325,6 +439,39 @@ def _is_transient_error(exc: Exception) -> bool:
     return any(marker in message for marker in transient_markers)
 
 
+def _status_code(exc: Exception) -> int | None:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+    return status_code if isinstance(status_code, int) else None
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    return _status_code(exc) == 429 or "rate limit" in str(exc).lower()
+
+
+def _retry_after_seconds(exc: Exception) -> float:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return DEFAULT_KEY_COOLDOWN_SECONDS
+
+    retry_after = None
+    try:
+        retry_after = headers.get("retry-after")
+    except Exception:
+        retry_after = None
+
+    if retry_after is None:
+        return DEFAULT_KEY_COOLDOWN_SECONDS
+
+    try:
+        return max(float(retry_after), 1.0)
+    except ValueError:
+        return DEFAULT_KEY_COOLDOWN_SECONDS
+
+
 def _call_with_retry(operation, max_attempts: int = 2):
     last_exception: Exception | None = None
     for attempt in range(1, max_attempts + 1):
@@ -332,7 +479,7 @@ def _call_with_retry(operation, max_attempts: int = 2):
             return operation()
         except Exception as exc:
             last_exception = exc
-            if attempt >= max_attempts or not _is_transient_error(exc):
+            if _is_rate_limit_error(exc) or attempt >= max_attempts or not _is_transient_error(exc):
                 raise
             time.sleep(min(attempt, 2))
 
@@ -341,7 +488,7 @@ def _call_with_retry(operation, max_attempts: int = 2):
 
 def _build_contents(
     prompt: str,
-    uploaded_files: list[Any],
+    file_parts: list[types.Part],
     history: list[HistoryTurn],
 ) -> list[types.Content]:
     contents: list[types.Content] = []
@@ -354,58 +501,35 @@ def _build_contents(
             )
         )
 
-    prompt_parts = [
-        types.Part.from_uri(file_uri=file_obj.uri, mime_type=file_obj.mime_type)
-        for file_obj in uploaded_files
-    ]
+    prompt_parts = list(file_parts)
     prompt_parts.append(types.Part.from_text(text=prompt))
     contents.append(types.Content(role="user", parts=prompt_parts))
 
     return contents
 
 
-def generate(
+def _generate_with_lease(
     prompt: str,
-    files: list[str] | None = None,
-    system_prompt: str | None = None,
-    model: str = DEFAULT_MODEL_NAME,
-    include_thinking: bool = False,
-    history: list[dict[str, Any]] | None = None,
+    requested_files: list[str],
+    effective_system_prompt: str,
+    model: str,
+    include_thinking: bool,
+    normalized_history: list[HistoryTurn],
+    lease: ApiKeyLease,
 ) -> dict[str, Any]:
-    """Execute a single Gemini request from prompt plus local files."""
-
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise ValueError("prompt must be a non-empty string.")
-    if not isinstance(model, str) or not model.strip():
-        raise ValueError("model must be a non-empty string.")
-    if model not in AVAILABLE_MODELS:
-        raise ValueError(f"Unsupported model '{model}'. Use list_gemini_models to inspect supported models.")
-    if files is not None and not isinstance(files, list):
-        raise ValueError("files must be a list of absolute file paths.")
-    if not isinstance(include_thinking, bool):
-        raise ValueError("include_thinking must be a boolean.")
-
-    normalized_history = _normalize_history(history)
-    requested_files = files or []
-    for file_path in requested_files:
-        if not isinstance(file_path, str) or not file_path.strip():
-            raise ValueError("files must contain only non-empty string paths.")
-        detect_mime(file_path)
-
-    effective_system_prompt = (
-        system_prompt.strip()
-        if isinstance(system_prompt, str) and system_prompt.strip()
-        else DEFAULT_SYSTEM_PROMPT
+    client = genai.Client(
+        vertexai=True,
+        credentials=lease.credentials,
+        project=lease.project_id,
+        location=lease.location,
     )
-
-    client = genai.Client(api_key=get_next_api_key())
     started_at = time.perf_counter()
 
-    uploaded_files = [
-        _call_with_retry(lambda path=file_path: _upload_file(path, client))
+    file_parts = [
+        _call_with_retry(lambda path=file_path: _load_file_part(path))
         for file_path in requested_files
     ]
-    contents = _build_contents(prompt=prompt, uploaded_files=uploaded_files, history=normalized_history)
+    contents = _build_contents(prompt=prompt, file_parts=file_parts, history=normalized_history)
     response = _call_with_retry(
         lambda: _call_api(
             client=client,
@@ -425,3 +549,92 @@ def generate(
         "usage": _extract_usage(response),
         "elapsed_ms": elapsed_ms,
     }
+
+
+def generate(
+    prompt: str,
+    files: list[str] | None = None,
+    system_prompt: str | None = None,
+    model: str = DEFAULT_MODEL_NAME,
+    include_thinking: bool = False,
+    history: list[dict[str, Any]] | None = None,
+    rate_limit_mode: str = RATE_LIMIT_MODE_FAIL_FAST,
+    fallback_models: list[str] | None = None,
+    rate_limit_max_wait_seconds: float | int | None = None,
+) -> dict[str, Any]:
+    """Execute a single Gemini request from prompt plus local files."""
+
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("prompt must be a non-empty string.")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("model must be a non-empty string.")
+    primary_model = model.strip()
+    model_sequence = _normalize_model_sequence(primary_model, fallback_models)
+    normalized_rate_limit_mode = _normalize_rate_limit_mode(rate_limit_mode)
+    max_wait_seconds = _normalize_rate_limit_max_wait_seconds(rate_limit_max_wait_seconds)
+    if files is not None and not isinstance(files, list):
+        raise ValueError("files must be a list of absolute file paths.")
+    if not isinstance(include_thinking, bool):
+        raise ValueError("include_thinking must be a boolean.")
+
+    normalized_history = _normalize_history(history)
+    requested_files = files or []
+    for file_path in requested_files:
+        if not isinstance(file_path, str) or not file_path.strip():
+            raise ValueError("files must contain only non-empty string paths.")
+        detect_mime(file_path)
+
+    effective_system_prompt = (
+        system_prompt.strip()
+        if isinstance(system_prompt, str) and system_prompt.strip()
+        else DEFAULT_SYSTEM_PROMPT
+    )
+
+    attempted_models: list[str] = []
+    last_rate_limit: GeminiRateLimitError | None = None
+    max_key_attempts = max(1, get_key_count())
+    wait_for_cooldown = normalized_rate_limit_mode == RATE_LIMIT_MODE_WAIT
+    attempts_per_model = max_key_attempts * (2 if wait_for_cooldown else 1)
+
+    for active_model in model_sequence:
+        attempted_models.append(active_model)
+        for _ in range(attempts_per_model):
+            try:
+                with acquire_vertex_credential_lease(
+                    model=active_model,
+                    wait_for_cooldown=wait_for_cooldown,
+                    max_wait_seconds=max_wait_seconds,
+                ) as acquired:
+                    try:
+                        return _generate_with_lease(
+                            prompt=prompt,
+                            requested_files=requested_files,
+                            effective_system_prompt=effective_system_prompt,
+                            model=active_model,
+                            include_thinking=include_thinking,
+                            normalized_history=normalized_history,
+                            lease=acquired.lease,
+                        )
+                    except Exception as exc:
+                        if not _is_rate_limit_error(exc):
+                            raise
+                        acquired.mark_cooldown(_retry_after_seconds(exc))
+                        last_rate_limit = GeminiRateLimitError(
+                            model=active_model,
+                            attempted_models=list(attempted_models),
+                            retry_after_seconds=_retry_after_seconds(exc),
+                            quota_slots=[acquired.quota_slot],
+                        )
+            except NoAvailableQuotaSlotError as exc:
+                last_rate_limit = GeminiRateLimitError(
+                    model=active_model,
+                    attempted_models=list(attempted_models),
+                    retry_after_seconds=exc.retry_after_seconds,
+                    quota_slots=exc.quota_slots,
+                )
+                break
+
+        if last_rate_limit is None:
+            continue
+
+    raise last_rate_limit or RuntimeError("Gemini request failed without raising an exception.")

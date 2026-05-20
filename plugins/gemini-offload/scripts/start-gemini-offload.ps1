@@ -35,7 +35,7 @@ function Import-CodexGeminiEnv {
   }
 
   $body = $sectionMatch.Groups["body"].Value
-  foreach ($name in @("GEMINI_OFFLOAD_KEYS", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_OFFLOAD_REPO")) {
+  foreach ($name in @("GEMINI_OFFLOAD_VERTEX_CREDENTIALS", "VERTEX_AI_CREDENTIALS", "GOOGLE_CLOUD_LOCATION", "VERTEX_AI_LOCATION", "GEMINI_OFFLOAD_REPO")) {
     $currentValue = (Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue).Value
     if (-not [string]::IsNullOrWhiteSpace($currentValue)) {
       continue
@@ -52,10 +52,23 @@ Import-CodexGeminiEnv
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pluginRoot = Split-Path -Parent $scriptDir
-$repoRoot = Resolve-Path (Join-Path $pluginRoot "..\\..")
+
+$configuredRepo = (Get-Item -Path "Env:GEMINI_OFFLOAD_REPO" -ErrorAction SilentlyContinue).Value
+if (-not [string]::IsNullOrWhiteSpace($configuredRepo)) {
+  if (-not (Test-Path -LiteralPath $configuredRepo)) {
+    throw "GEMINI_OFFLOAD_REPO points to a missing path: $configuredRepo"
+  }
+  $repoRoot = Resolve-Path -LiteralPath $configuredRepo
+} else {
+  $repoRoot = Resolve-Path (Join-Path $pluginRoot "..\\..")
+}
 
 if (-not (Test-Path -LiteralPath $repoRoot)) {
-  throw "gemini-offload repo root could not be resolved."
+  throw "gemini-offload repo root could not be resolved. Set GEMINI_OFFLOAD_REPO to the checked-out repository."
+}
+
+if (-not (Test-Path -LiteralPath (Join-Path $repoRoot "mcp_server"))) {
+  throw "gemini-offload repo root has no mcp_server package. Set GEMINI_OFFLOAD_REPO to the checked-out repository."
 }
 
 Set-Location -LiteralPath $repoRoot

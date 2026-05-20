@@ -1,6 +1,6 @@
 ---
 name: gemini-offload-workflows
-description: Use when Codex needs to offload a bounded multimodal subtask to the local gemini-offload MCP server, especially OCR, audio transcription, text cleanup, file-grounded extraction, or Gemini image generation. Prefer this skill when the main agent should keep its context small, when large outputs should be written to disk via output_path, when a large source should be sampled and chunked before batch processing, or when repeated prompts should be loaded from system_prompt_path or history_path.
+description: Use when Codex needs to offload a bounded multimodal subtask to the local gemini-offload MCP server, especially OCR, audio transcription, text cleanup, or file-grounded extraction. Prefer this skill when the main agent should keep its context small, when large outputs should be written to disk via output_path, when a large source should be sampled and chunked before batch processing, or when repeated prompts should be loaded from system_prompt_path or history_path.
 ---
 
 # Gemini Offload Workflows
@@ -13,7 +13,7 @@ Use `gemini-offload` as a stateless worker for one bounded subtask at a time. Ke
 2. Validate each input file with `detect_mime` when file type support is uncertain.
 3. Prefer `output_path` for any non-trivial response so the full result is written to disk.
 4. Use absolute paths for `files`, `output_path`, `system_prompt_path`, and `history_path`.
-5. Call `gemini_generate` sequentially on a single stdio server connection. This server does not parallelize batched calls in one message.
+5. Use `gemini_generate` for one artifact, or `gemini_generate_batch` for independent artifacts that can run concurrently.
 
 ## Decision Rules
 
@@ -23,8 +23,11 @@ Use `gemini-offload` as a stateless worker for one bounded subtask at a time. Ke
 - Use `history_path` instead of inline `history` when few-shot examples already exist as JSON.
 - Use `list_gemini_models` before choosing a model if the task is model-sensitive or the available surface may have changed.
 - Prefer a high-quality text model for first-pass OCR or transcription pilots when output fidelity matters more than speed.
-- Use image-capable models only when you truly need image output. Text-only tasks should stay on text models.
-- Do not expect server-side batching, retries across subtasks, or aggregation. Own that logic in the orchestrator.
+- Model choices are intentionally narrow:
+  - `gemini-3.1-pro-preview`: best overall for complex OCR, long-context synthesis, multimodal reasoning, and hard agentic or coding tasks.
+  - `gemini-3-flash-preview`: emergency fallback when the main path is unavailable or too slow.
+  - `gemini-3.5-flash`: fast default for throughput-sensitive work; near-Pro agentic and coding capability at Flash speed, and better than 3.1 Pro on some narrower workloads.
+- Use `gemini_generate_batch` only for independent jobs with unique `output_path` values. Keep chunking, quality gates, and final aggregation in the orchestrator.
 
 ## Core Workflow
 
@@ -36,7 +39,6 @@ Write a prompt that asks for one artifact, not a whole project. Good examples:
 - Transcribe one audio chunk into clean text
 - Normalize one noisy text file into a target schema
 - Extract key fields from one invoice image
-- Generate one reference image from a text prompt
 
 Avoid prompts that ask Gemini to coordinate multiple files, chunking policy, or downstream synthesis logic unless that coordination itself is the artifact you want back.
 
@@ -45,7 +47,6 @@ Avoid prompts that ask Gemini to coordinate multiple files, chunking policy, or 
 Prefer `output_path` unless the answer is definitely short.
 
 - With `output_path`, full text is written to disk and the inline response is only a preview.
-- If Gemini returns images and `output_path` is set, sibling image files are written next to that path.
 - Without `output_path`, only a truncated preview is recoverable inline.
 
 Use unique output paths per subtask so repeated or staged runs do not overwrite earlier artifacts.
@@ -72,8 +73,6 @@ Check:
 - `char_count`
 - `text_preview`
 - `truncated`
-- `image_count`
-- `images[].output_path` when image files were produced
 
 If the preview looks wrong, adjust the prompt or chunk plan before launching more similar calls.
 
@@ -168,14 +167,14 @@ If quality is not good enough:
 
 Repeat only until the results are consistently usable. Do not start a large batch while still guessing.
 
-### 6. Run the batch sequentially
+### 6. Run the batch
 
-This MCP server does not turn one batched request into parallel work. For multi-chunk jobs, prepare a todo list or manifest in the orchestrator and call the tool sequentially.
+For multi-chunk jobs, prepare a todo list or manifest in the orchestrator and call `gemini_generate_batch` with one job per independent artifact. The server runs jobs concurrently, defaults concurrency to the configured Vertex credential count, and tracks rate limits per Vertex project/location/model quota slot. If a slot returns 429, the default `fail_fast` mode returns a structured rate-limit result; use `rate_limit_mode: "wait"` or explicit `fallback_models` only when that behavior is desired.
 
 Recommended per-chunk loop:
 
 1. pick the next chunk
-2. call `gemini_generate`
+2. add one batch job with a unique `output_path`
 3. inspect `text_preview` and receipt fields
 4. continue only if the result still looks on-format
 5. open the saved artifact only when preview or metrics suggest a problem, or when doing periodic spot checks
@@ -194,8 +193,8 @@ Recommended call shape:
 {
   "prompt": "Convert this chunk to clean markdown. Preserve headings, tables, list structure, and uncertain text markers.",
   "files": ["D:/work/input/chunk-01.pdf"],
-  "system_prompt_path": "D:/work/gemini-offload/prompts/ocr_system.md",
-  "history_path": "D:/work/gemini-offload/prompts/ocr_fewshot.json",
+  "system_prompt_path": "D:/path/to/gemini-offload/prompts/ocr_system.md",
+  "history_path": "D:/path/to/gemini-offload/prompts/ocr_fewshot.json",
   "model": "gemini-3.1-pro-preview",
   "output_path": "D:/work/out/chunk-01.md"
 }
@@ -213,7 +212,7 @@ Example:
 {
   "prompt": "Transcribe this chunk into clean Korean text. Preserve meaning and speaker order. Return plain text paragraphs.",
   "files": ["D:/work/input/lecture-part-01.m4a"],
-  "model": "gemini-3-flash-preview",
+  "model": "gemini-3.5-flash",
   "output_path": "D:/work/out/lecture-part-01.txt"
 }
 ```
@@ -228,7 +227,7 @@ Example:
 {
   "prompt": "Extract the target fields and return minified JSON only.",
   "files": ["D:/work/input/invoice-01.png"],
-  "model": "gemini-2.5-flash",
+  "model": "gemini-3.5-flash",
   "output_path": "D:/work/out/invoice-01.json"
 }
 ```
@@ -245,37 +244,17 @@ Example:
 {
   "prompt": "Rewrite this text into readable Korean while preserving factual content and order. Do not summarize.",
   "files": ["D:/work/intermediate/raw-part-01.txt"],
-  "model": "gemini-3.1-flash-lite-preview",
+  "model": "gemini-3.5-flash",
   "output_path": "D:/work/out/clean-part-01.txt"
 }
 ```
-
-### Image generation
-
-Use only with an image-capable model. Expect image files, not just text.
-
-Example:
-
-```json
-{
-  "prompt": "Generate a clean product illustration of a silver desk lamp on a white background.",
-  "model": "gemini-2.5-flash-image",
-  "output_path": "D:/work/out/lamp.txt"
-}
-```
-
-Behavior:
-
-- Text, if any, is written to `lamp.txt`.
-- Images are written as sibling files such as `lamp.image-1.png`.
-- The inline MCP response includes image metadata and file paths, not the full saved image bytes.
 
 ## Failure Modes To Watch
 
 - Relative paths: this server requires absolute paths.
 - Missing `output_path`: full text becomes unrecoverable from the inline preview.
-- Wrong model: image output requires an image-capable model.
-- Over-batched orchestration: multiple calls in one message do not become parallel work.
+- Wrong model: the server only allows `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, and `gemini-3.5-flash`; `gemini-2.5*` IDs are blocked.
+- Over-batched orchestration: only batch independent jobs with unique output paths.
 - Starting a full run before a pilot: quality problems get multiplied across every chunk.
 - Overloaded prompt: if a prompt asks for extraction, cleanup, summarization, and formatting at once, split it into multiple subtasks instead.
 
@@ -287,5 +266,5 @@ Behavior:
 - Prefer `output_path`.
 - Store reusable prompt assets on disk and reference them by path.
 - Pilot one chunk before scaling out.
-- Run multi-chunk jobs sequentially and inspect the preview after each call.
+- Run independent multi-chunk jobs with `gemini_generate_batch` and inspect previews before trusting the full batch.
 - Read the saved artifact only when the next step truly needs it.
