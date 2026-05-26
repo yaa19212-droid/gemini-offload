@@ -12,9 +12,32 @@ result aggregation stay with the client.
 
 ```bash
 pip install -e .
-# or, without cloning:
-pip install mcp google-genai httpx
 ```
+
+For personal Windows machines, use a repo-local checkout and run:
+
+```powershell
+.\install-local.ps1
+```
+
+The script installs the MCP server in editable mode, checks the expected
+Vertex credential manifest path, and prints the Codex `config.toml` block for
+that machine.
+
+## Packaging model
+
+This repository has two related packaging surfaces:
+
+- `gemini-offload-mcp` is the Python package. Its wheel contains the
+  `mcp_server` package and the `gemini-offload-mcp` console script.
+- `plugins/gemini-offload` is the repo-local Codex plugin bundle. It contains
+  the plugin manifest, MCP launcher script, icon, and workflow skill.
+
+The Codex plugin expects a full repo checkout unless `GEMINI_OFFLOAD_REPO`
+points to one. Do not copy only `plugins/gemini-offload` to a new machine and
+expect it to run standalone; the launcher starts the server from the checkout.
+Reusable prompt assets live under `prompts/`, so keep them with the checkout
+when using the bundled workflow skill.
 
 ## Vertex AI credentials
 
@@ -31,10 +54,21 @@ Recommended manifest:
   {
     "project_id": "my-project",
     "client_email": "service-account@my-project.iam.gserviceaccount.com",
-    "path": "C:/path/to/vertex-ai/service-accounts/my-project-key.json"
+    "path": "./my-project-key.json"
   }
 ]
 ```
+
+For easier machine-to-machine migration, put both the manifest and service
+account JSON files under:
+
+```text
+C:/Users/<user>/.secrets/vertex-ai/service-accounts/
+```
+
+Relative `path` values are resolved from the manifest directory, so the same
+manifest can be reused on another Windows machine after copying the whole
+service-account folder into that user's home directory.
 
 Set `GOOGLE_CLOUD_LOCATION` or `VERTEX_AI_LOCATION` to override the default
 Vertex location (`global`). Rate limits are tracked per Vertex
@@ -104,6 +138,9 @@ GEMINI_OFFLOAD_REPO = "D:/path/to/gemini-offload"
 GEMINI_OFFLOAD_VERTEX_CREDENTIALS = "C:/path/to/vertex-ai/service-accounts/manifest.json"
 GOOGLE_CLOUD_LOCATION = "global"
 ```
+
+On a new personal Windows machine, prefer running `.\install-local.ps1` from
+the checkout and then paste the printed block into `~/.codex/config.toml`.
 
 Notes:
 
