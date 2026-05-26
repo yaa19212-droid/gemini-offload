@@ -307,6 +307,100 @@ def _extract_response_text(response) -> str:
     return payload["text"]
 
 
+def _get_field(obj: Any, snake_name: str, camel_name: str | None = None) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        if snake_name in obj:
+            return obj.get(snake_name)
+        if camel_name is not None:
+            return obj.get(camel_name)
+        return None
+
+    value = getattr(obj, snake_name, None)
+    if value is not None:
+        return value
+    if camel_name is not None:
+        return getattr(obj, camel_name, None)
+    return None
+
+
+def _first_candidate(response: Any) -> Any:
+    candidates = _get_field(response, "candidates")
+    if isinstance(candidates, list) and candidates:
+        return candidates[0]
+    return None
+
+
+def _normalize_source_reference(source_index: int, confidence_score: Any) -> dict[str, Any]:
+    source_reference: dict[str, Any] = {"index": source_index}
+    if isinstance(confidence_score, (int, float)) and not isinstance(confidence_score, bool):
+        source_reference["grounding_confidence"] = float(confidence_score)
+    return source_reference
+
+
+def _normalize_grounding_metadata(response: Any) -> dict[str, Any]:
+    """Return the agent-useful subset of Gemini grounding metadata."""
+
+    candidate = _first_candidate(response)
+    metadata = _get_field(candidate, "grounding_metadata", "groundingMetadata")
+    if metadata is None:
+        return {}
+
+    raw_queries = _get_field(metadata, "web_search_queries", "webSearchQueries")
+    queries = [query for query in raw_queries or [] if isinstance(query, str) and query.strip()]
+
+    sources: list[dict[str, Any]] = []
+    raw_chunks = _get_field(metadata, "grounding_chunks", "groundingChunks")
+    for index, chunk in enumerate(raw_chunks or []):
+        web = _get_field(chunk, "web")
+        if web is None:
+            continue
+
+        uri = _get_field(web, "uri")
+        title = _get_field(web, "title")
+        source: dict[str, Any] = {"index": index}
+        if isinstance(title, str) and title.strip():
+            source["title"] = title
+        if isinstance(uri, str) and uri.strip():
+            source["uri"] = uri
+        if len(source) > 1:
+            sources.append(source)
+
+    supports: list[dict[str, Any]] = []
+    raw_supports = _get_field(metadata, "grounding_supports", "groundingSupports")
+    for support in raw_supports or []:
+        segment = _get_field(support, "segment")
+        text = _get_field(segment, "text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+
+        raw_source_indices = _get_field(support, "grounding_chunk_indices", "groundingChunkIndices") or []
+        raw_confidence_scores = _get_field(support, "confidence_scores", "confidenceScores") or []
+        source_refs: list[dict[str, Any]] = []
+        for source_position, source_index in enumerate(raw_source_indices):
+            if isinstance(source_index, bool) or not isinstance(source_index, int):
+                continue
+            confidence_score = (
+                raw_confidence_scores[source_position]
+                if isinstance(raw_confidence_scores, list) and source_position < len(raw_confidence_scores)
+                else None
+            )
+            source_refs.append(_normalize_source_reference(source_index, confidence_score))
+
+        if source_refs:
+            supports.append({"text": text, "sources": source_refs})
+
+    grounding: dict[str, Any] = {}
+    if queries:
+        grounding["queries"] = queries
+    if sources:
+        grounding["sources"] = sources
+    if supports:
+        grounding["supports"] = supports
+    return grounding
+
+
 def _iter_response_parts(response) -> list[Any]:
     parts = getattr(response, "parts", None)
     if parts:
@@ -387,6 +481,7 @@ def _call_api(
     contents_list: list[types.Content],
     system_prompt: str,
     include_thinking: bool,
+    google_search: bool = False,
 ):
     """Call Gemini API with the prepared contents."""
 
@@ -394,6 +489,8 @@ def _call_api(
     model_spec = MODEL_SPECS.get(model_name, ModelSpec())
 
     config_kwargs = {"system_instruction": system_prompt}
+    if google_search:
+        config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
     if model_spec.supports_image_output:
         config_kwargs["response_modalities"] = ["TEXT", "IMAGE"]
     if include_thinking and model_spec.supports_thinking:
@@ -514,6 +611,7 @@ def _generate_with_lease(
     effective_system_prompt: str,
     model: str,
     include_thinking: bool,
+    google_search: bool,
     normalized_history: list[HistoryTurn],
     lease: ApiKeyLease,
 ) -> dict[str, Any]:
@@ -537,18 +635,23 @@ def _generate_with_lease(
             contents_list=contents,
             system_prompt=effective_system_prompt,
             include_thinking=include_thinking,
+            google_search=google_search,
         )
     )
     payload = _extract_response_payload(response)
+    grounding = _normalize_grounding_metadata(response)
 
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-    return {
+    result = {
         "text": payload["text"],
         "images": payload["images"],
         "model": _extract_response_model(response, model),
         "usage": _extract_usage(response),
         "elapsed_ms": elapsed_ms,
     }
+    if grounding:
+        result["grounding"] = grounding
+    return result
 
 
 def generate(
@@ -561,6 +664,7 @@ def generate(
     rate_limit_mode: str = RATE_LIMIT_MODE_FAIL_FAST,
     fallback_models: list[str] | None = None,
     rate_limit_max_wait_seconds: float | int | None = None,
+    google_search: bool = False,
 ) -> dict[str, Any]:
     """Execute a single Gemini request from prompt plus local files."""
 
@@ -576,6 +680,8 @@ def generate(
         raise ValueError("files must be a list of absolute file paths.")
     if not isinstance(include_thinking, bool):
         raise ValueError("include_thinking must be a boolean.")
+    if not isinstance(google_search, bool):
+        raise ValueError("google_search must be a boolean.")
 
     normalized_history = _normalize_history(history)
     requested_files = files or []
@@ -612,6 +718,7 @@ def generate(
                             effective_system_prompt=effective_system_prompt,
                             model=active_model,
                             include_thinking=include_thinking,
+                            google_search=google_search,
                             normalized_history=normalized_history,
                             lease=acquired.lease,
                         )

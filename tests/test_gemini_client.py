@@ -143,6 +143,85 @@ class GeminiClientTests(unittest.TestCase):
         self.assertEqual(config.thinking_config.include_thoughts, True)
         self.assertIsNone(config.response_modalities)
 
+    def test_google_search_uses_grounding_tool_config(self) -> None:
+        client = _RecordingClient()
+
+        gemini_client._call_api(
+            client=client,
+            model_name="gemini-3.5-flash",
+            contents_list=[],
+            system_prompt="system",
+            include_thinking=False,
+            google_search=True,
+        )
+
+        config = client.models.calls[0]["config"]
+        self.assertEqual(len(config.tools), 1)
+        self.assertIsNotNone(config.tools[0].google_search)
+
+    def test_grounding_metadata_is_normalized_for_agents(self) -> None:
+        response = {
+            "candidates": [
+                {
+                    "groundingMetadata": {
+                        "webSearchQueries": [
+                            "UEFA Euro 2024 winner",
+                            "Spain England Euro 2024 final score",
+                        ],
+                        "searchEntryPoint": {
+                            "renderedContent": "<style>...</style><div>...</div>",
+                            "sdkBlob": "opaque",
+                        },
+                        "groundingChunks": [
+                            {"web": {"title": "uefa.com", "uri": "https://example.test/uefa"}},
+                            {"web": {"title": "bbc.com", "uri": "https://example.test/bbc"}},
+                        ],
+                        "groundingSupports": [
+                            {
+                                "segment": {
+                                    "startIndex": 0,
+                                    "endIndex": 43,
+                                    "text": "Spain won Euro 2024 by defeating England 2-1.",
+                                },
+                                "groundingChunkIndices": [0, 1],
+                                "confidenceScores": [0.92, 0.84],
+                            }
+                        ],
+                        "retrievalMetadata": {},
+                        "retrievalQueries": [],
+                        "sourceFlaggingUris": [],
+                    }
+                }
+            ]
+        }
+
+        grounding = gemini_client._normalize_grounding_metadata(response)
+
+        self.assertEqual(
+            grounding,
+            {
+                "queries": [
+                    "UEFA Euro 2024 winner",
+                    "Spain England Euro 2024 final score",
+                ],
+                "sources": [
+                    {"index": 0, "title": "uefa.com", "uri": "https://example.test/uefa"},
+                    {"index": 1, "title": "bbc.com", "uri": "https://example.test/bbc"},
+                ],
+                "supports": [
+                    {
+                        "text": "Spain won Euro 2024 by defeating England 2-1.",
+                        "sources": [
+                            {"index": 0, "grounding_confidence": 0.92},
+                            {"index": 1, "grounding_confidence": 0.84},
+                        ],
+                    }
+                ],
+            },
+        )
+        self.assertNotIn("renderedContent", str(grounding))
+        self.assertNotIn("startIndex", str(grounding))
+
     def test_generate_preserves_inline_image_parts(self) -> None:
         with patch(
             "mcp_server.gemini_client.acquire_vertex_credential_lease",

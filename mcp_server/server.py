@@ -199,6 +199,7 @@ async def _run_generate_from_args(args: dict[str, Any]) -> dict[str, Any]:
         args.get("rate_limit_mode", RATE_LIMIT_MODE_FAIL_FAST),
         args.get("fallback_models"),
         args.get("rate_limit_max_wait_seconds"),
+        args.get("google_search", False),
     )
     return _apply_output_policy(result, args.get("output_path"))
 
@@ -228,6 +229,11 @@ def _batch_job_schema() -> dict[str, Any]:
                 "default": DEFAULT_MODEL_NAME,
             },
             "include_thinking": {"type": "boolean", "default": False},
+            "google_search": {
+                "type": "boolean",
+                "description": "Enable Gemini Google Search grounding for this request.",
+                "default": False,
+            },
             "history": {
                 "type": "array",
                 "items": {
@@ -316,6 +322,11 @@ def _tool_definitions() -> list[mcp_types.Tool]:
                         "description": "Whether to include model thinking in the response when supported.",
                         "default": False,
                     },
+                    "google_search": {
+                        "type": "boolean",
+                        "description": "Enable Gemini Google Search grounding for this request.",
+                        "default": False,
+                    },
                     "history": {
                         "type": "array",
                         "description": "Optional few-shot turns with role/text pairs.",
@@ -395,6 +406,7 @@ def _tool_definitions() -> list[mcp_types.Tool]:
                         "type": "array",
                         "items": {"type": "object"},
                     },
+                    "grounding": {"type": "object"},
                 },
                 "required": [
                     "model",

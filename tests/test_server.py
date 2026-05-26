@@ -143,6 +143,22 @@ class ServerOutputTests(unittest.TestCase):
         self.assertIn("fallback_models", properties)
         self.assertEqual(properties["rate_limit_max_wait_seconds"]["default"], 120.0)
 
+    def test_gemini_generate_tool_schema_includes_google_search_option(self) -> None:
+        server = _load_server_module()
+
+        tools = server._tool_definitions()
+        gemini_generate = next(tool for tool in tools if tool.name == "gemini_generate")
+        batch_job_schema = server._batch_job_schema()
+
+        self.assertEqual(
+            gemini_generate.inputSchema["properties"]["google_search"]["default"],
+            False,
+        )
+        self.assertEqual(
+            batch_job_schema["properties"]["google_search"]["default"],
+            False,
+        )
+
     def test_inline_image_output_becomes_mcp_image_content(self) -> None:
         server = _load_server_module()
 
@@ -229,6 +245,43 @@ class ServerOutputTests(unittest.TestCase):
         self.assertEqual(wrapped.structuredContent["job_count"], 2)
         self.assertEqual(wrapped.structuredContent["ok_count"], 2)
         self.assertEqual([item["id"] for item in wrapped.structuredContent["results"]], ["a", "b"])
+
+    def test_google_search_option_is_passed_to_generate(self) -> None:
+        server = _load_server_module()
+        observed: list[bool] = []
+
+        def fake_generate(
+            prompt,
+            files,
+            system_prompt,
+            model,
+            include_thinking,
+            history,
+            rate_limit_mode,
+            fallback_models,
+            rate_limit_max_wait_seconds,
+            google_search,
+        ):
+            observed.append(google_search)
+            return {
+                "text": "ok",
+                "model": model,
+                "usage": {},
+                "elapsed_ms": 1,
+                "images": [],
+            }
+
+        async def run_generate():
+            with patch.object(server, "generate", fake_generate):
+                return await server.handle_call_tool(
+                    "gemini_generate",
+                    {"prompt": "one", "google_search": True},
+                )
+
+        wrapped = anyio.run(run_generate)
+
+        self.assertEqual(observed, [True])
+        self.assertEqual(wrapped.structuredContent["text_preview"], "ok")
 
     def test_single_generate_returns_structured_rate_limit_result(self) -> None:
         server = _load_server_module()
