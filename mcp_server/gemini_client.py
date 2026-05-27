@@ -452,7 +452,7 @@ def _extract_response_payload(response) -> dict[str, Any]:
         elif response is not None and not images:
             answer_parts.append(str(response))
 
-    answer_text = "".join(part for part in answer_parts if isinstance(part, str)).strip()
+    answer_text = "".join(part for part in answer_parts if isinstance(part, str))
     return {
         "text": answer_text if answer_text else "",
         "images": images,
@@ -482,6 +482,7 @@ def _call_api(
     system_prompt: str,
     include_thinking: bool,
     google_search: bool = False,
+    response_json_schema: dict[str, Any] | None = None,
 ):
     """Call Gemini API with the prepared contents."""
 
@@ -491,6 +492,11 @@ def _call_api(
     config_kwargs = {"system_instruction": system_prompt}
     if google_search:
         config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+    if response_json_schema is not None:
+        if not isinstance(response_json_schema, dict):
+            raise ValueError("response_json_schema must be a JSON object.")
+        config_kwargs["response_mime_type"] = "application/json"
+        config_kwargs["response_json_schema"] = response_json_schema
     if model_spec.supports_image_output:
         config_kwargs["response_modalities"] = ["TEXT", "IMAGE"]
     if include_thinking and model_spec.supports_thinking:
@@ -612,6 +618,7 @@ def _generate_with_lease(
     model: str,
     include_thinking: bool,
     google_search: bool,
+    response_json_schema: dict[str, Any] | None,
     normalized_history: list[HistoryTurn],
     lease: ApiKeyLease,
 ) -> dict[str, Any]:
@@ -636,6 +643,7 @@ def _generate_with_lease(
             system_prompt=effective_system_prompt,
             include_thinking=include_thinking,
             google_search=google_search,
+            response_json_schema=response_json_schema,
         )
     )
     payload = _extract_response_payload(response)
@@ -665,6 +673,7 @@ def generate(
     fallback_models: list[str] | None = None,
     rate_limit_max_wait_seconds: float | int | None = None,
     google_search: bool = False,
+    response_json_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute a single Gemini request from prompt plus local files."""
 
@@ -682,6 +691,8 @@ def generate(
         raise ValueError("include_thinking must be a boolean.")
     if not isinstance(google_search, bool):
         raise ValueError("google_search must be a boolean.")
+    if response_json_schema is not None and not isinstance(response_json_schema, dict):
+        raise ValueError("response_json_schema must be a JSON object.")
 
     normalized_history = _normalize_history(history)
     requested_files = files or []
@@ -719,6 +730,7 @@ def generate(
                             model=active_model,
                             include_thinking=include_thinking,
                             google_search=google_search,
+                            response_json_schema=response_json_schema,
                             normalized_history=normalized_history,
                             lease=acquired.lease,
                         )

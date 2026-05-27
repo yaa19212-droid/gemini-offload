@@ -146,6 +146,8 @@ Notes:
 
 - Do not set `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `GEMINI_OFFLOAD_KEYS`; those are AI Studio routes.
 - The server sends local files as inline Vertex parts and does not use the Gemini Files API.
+- Set `GEMINI_OFFLOAD_OUTPUT_DIR` to an absolute path if you want automatic
+  large-response spill files outside the OS temp directory.
 - After updating `config.toml`, restart Codex or open a new session so the MCP server list is reloaded.
 
 ## Tools
@@ -161,6 +163,9 @@ Upload local absolute-path files and run `generate_content`.
 | `system_prompt` | string | optional |
 | `model` | string | default `gemini-3.1-pro-preview` |
 | `include_thinking` | bool | default `false` |
+| `google_search` | bool | default `false`; enables Google Search grounding |
+| `response_json_schema` | object | optional JSON Schema object for structured JSON output |
+| `response_json_schema_path` | string | optional absolute path to a JSON Schema file |
 | `history` | `[{role, text}]` | optional few-shot turns |
 | `output_path` | string | **recommended**, absolute path |
 | `rate_limit_mode` | string | `fail_fast` default, or `wait` |
@@ -168,9 +173,20 @@ Upload local absolute-path files and run `generate_content`.
 | `rate_limit_max_wait_seconds` | number | wait-mode cap, default `120` |
 
 **Output policy:**
-- With `output_path`: full UTF-8 text is written to disk, response returns
-  `{output_path, byte_count, char_count, text_preview (100 chars), truncated, model, usage, elapsed_ms}`.
-- Without `output_path`: response returns `{text_preview (300 chars), char_count, truncated, ...}`. The full text is **not recoverable** from the inline response — use `output_path` for anything non-trivial.
+- Short responses up to 4096 UTF-8 bytes return full inline `text`.
+- Providing `output_path` forces file output even for short responses.
+- Larger responses are written to `output_path` when provided, or to
+  `GEMINI_OFFLOAD_OUTPUT_DIR` / OS temp when omitted. The inline response
+  returns `text_preview`, `output_path`, `byte_count`, `line_count`, and
+  `read_guidance`.
+- With `response_json_schema` or `response_json_schema_path`, short valid JSON
+  returns parsed `response_json`. Larger JSON returns `response_json_preview`
+  plus `output_path`.
+- With `google_search: true`: response may include normalized `grounding`
+  metadata with `queries`, `sources`, and `supports`. Google Search UI payloads
+  such as `renderedContent` and `sdkBlob` are intentionally omitted.
+- `structuredContent` is the authoritative result. `content[0].text` is only a
+  short receipt or read guide, not a serialized copy of `structuredContent`.
 
 ### `list_gemini_models`
 
@@ -205,6 +221,12 @@ Vertex project/location/model quota slot. If a slot returns 429, the default
 fallback guidance; callers may opt into `rate_limit_mode: "wait"` or provide
 explicit `fallback_models`.
 
+Batch calls remain synchronous at the tool boundary, but jobs run concurrently
+up to `max_concurrency`. If the final batch response would exceed 4096 UTF-8
+bytes, successful job outputs are saved to files and the inline response keeps
+receipts, previews, paths, and `read_guidance`. If even the compacted results
+are too large, the compacted manifest is saved to `results_path`.
+
 ### `gemini_generate_batch`
 
 Run multiple independent `gemini_generate`-shaped jobs concurrently.
@@ -230,4 +252,6 @@ Run multiple independent `gemini_generate`-shaped jobs concurrently.
 ```
 
 The result preserves input order and returns per-job `ok`, preview, usage,
-timing, output path, and error fields.
+timing, output path, and error fields. Large batches may return
+`results_compacted`; follow `read_guidance` and read only targeted
+`output_path` files or `results_path` sections.

@@ -44,10 +44,14 @@ Avoid prompts that ask Gemini to coordinate multiple files, chunking policy, or 
 
 ### 2. Choose the output strategy
 
-Prefer `output_path` unless the answer is definitely short.
+Prefer `output_path` when you have a natural artifact destination. If omitted,
+short responses are returned inline and larger responses are automatically
+written to the configured spill directory.
 
-- With `output_path`, full text is written to disk and the inline response is only a preview.
-- Without `output_path`, only a truncated preview is recoverable inline.
+- With `output_path`, full text is written to disk and the inline response is only a preview, even for short responses.
+- Without `output_path`, responses over 4096 UTF-8 bytes return a preview,
+  `output_path`, and `read_guidance`.
+- Treat `structuredContent` as authoritative. `content[0].text` is only a short receipt or guide.
 
 Use unique output paths per subtask so repeated or staged runs do not overwrite earlier artifacts.
 
@@ -71,8 +75,12 @@ Check:
 - `elapsed_ms`
 - `usage`
 - `char_count`
-- `text_preview`
+- `byte_count`
+- `line_count`
+- `text` or `text_preview`
 - `truncated`
+- `output_path`
+- `read_guidance`
 
 If the preview looks wrong, adjust the prompt or chunk plan before launching more similar calls.
 
@@ -171,6 +179,12 @@ Repeat only until the results are consistently usable. Do not start a large batc
 
 For multi-chunk jobs, prepare a todo list or manifest in the orchestrator and call `gemini_generate_batch` with one job per independent artifact. The server runs jobs concurrently, defaults concurrency to the configured Vertex credential count, and tracks rate limits per Vertex project/location/model quota slot. If a slot returns 429, the default `fail_fast` mode returns a structured rate-limit result; use `rate_limit_mode: "wait"` or explicit `fallback_models` only when that behavior is desired.
 
+The batch tool is synchronous at the MCP boundary, but individual jobs run
+concurrently up to `max_concurrency`. A 4096-byte aggregate inline budget is
+applied after all jobs finish. If `results_compacted` or `results_path` is
+present, follow `read_guidance` and inspect only targeted job files or manifest
+sections.
+
 Recommended per-chunk loop:
 
 1. pick the next chunk
@@ -252,7 +266,8 @@ Example:
 ## Failure Modes To Watch
 
 - Relative paths: this server requires absolute paths.
-- Missing `output_path`: full text becomes unrecoverable from the inline preview.
+- Missing `output_path`: large responses are auto-saved; follow `read_guidance`
+  and inspect targeted sections or ranges before reading the whole file.
 - Wrong model: the server only allows `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, and `gemini-3.5-flash`; `gemini-2.5*` IDs are blocked.
 - Over-batched orchestration: only batch independent jobs with unique output paths.
 - Starting a full run before a pilot: quality problems get multiplied across every chunk.

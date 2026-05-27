@@ -35,7 +35,7 @@ function Import-CodexGeminiEnv {
   }
 
   $body = $sectionMatch.Groups["body"].Value
-  foreach ($name in @("GEMINI_OFFLOAD_VERTEX_CREDENTIALS", "VERTEX_AI_CREDENTIALS", "GOOGLE_CLOUD_LOCATION", "VERTEX_AI_LOCATION", "GEMINI_OFFLOAD_REPO")) {
+  foreach ($name in @("GEMINI_OFFLOAD_VERTEX_CREDENTIALS", "VERTEX_AI_CREDENTIALS", "GOOGLE_CLOUD_LOCATION", "VERTEX_AI_LOCATION", "GEMINI_OFFLOAD_REPO", "GEMINI_OFFLOAD_OUTPUT_DIR")) {
     $currentValue = (Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue).Value
     if (-not [string]::IsNullOrWhiteSpace($currentValue)) {
       continue

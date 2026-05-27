@@ -159,6 +159,30 @@ class GeminiClientTests(unittest.TestCase):
         self.assertEqual(len(config.tools), 1)
         self.assertIsNotNone(config.tools[0].google_search)
 
+    def test_response_json_schema_sets_json_output_config(self) -> None:
+        client = _RecordingClient()
+        schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        }
+
+        gemini_client._call_api(
+            client=client,
+            model_name="gemini-3.5-flash",
+            contents_list=[],
+            system_prompt="system",
+            include_thinking=False,
+            google_search=True,
+            response_json_schema=schema,
+        )
+
+        config = client.models.calls[0]["config"]
+        self.assertEqual(config.response_mime_type, "application/json")
+        self.assertEqual(config.response_json_schema, schema)
+        self.assertEqual(len(config.tools), 1)
+        self.assertIsNotNone(config.tools[0].google_search)
+
     def test_grounding_metadata_is_normalized_for_agents(self) -> None:
         response = {
             "candidates": [
@@ -221,6 +245,15 @@ class GeminiClientTests(unittest.TestCase):
         )
         self.assertNotIn("renderedContent", str(grounding))
         self.assertNotIn("startIndex", str(grounding))
+
+    def test_extract_response_payload_preserves_outer_whitespace_for_budgeting(self) -> None:
+        padded_text = ("\n" * 4) + '{"name":"Ada"}' + (" " * 5000)
+        response = SimpleNamespace(text=padded_text)
+
+        payload = gemini_client._extract_response_payload(response)
+
+        self.assertEqual(payload["text"], padded_text)
+        self.assertGreater(len(payload["text"].encode("utf-8")), 4096)
 
     def test_generate_preserves_inline_image_parts(self) -> None:
         with patch(

@@ -2,6 +2,7 @@
 param(
   [string]$ManifestPath = (Join-Path $HOME ".secrets\vertex-ai\service-accounts\manifest.json"),
   [string]$GoogleCloudLocation = "global",
+  [string]$OutputDir = "",
   [switch]$SkipEditableInstall
 )
 
@@ -39,6 +40,10 @@ if (-not $SkipEditableInstall) {
 $repoPath = Resolve-ExistingPathForConfig -Path $repoRoot
 $startScriptPath = Resolve-ExistingPathForConfig -Path (Join-Path $repoRoot "plugins\gemini-offload\scripts\start-gemini-offload.ps1")
 $manifestConfigPath = Convert-ToForwardSlashPath -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ManifestPath)
+$outputDirConfigPath = $null
+if (-not [string]::IsNullOrWhiteSpace($OutputDir)) {
+  $outputDirConfigPath = Convert-ToForwardSlashPath -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDir)
+}
 
 Write-Host ""
 if (Test-Path -LiteralPath $ManifestPath) {
@@ -61,5 +66,8 @@ Write-Host "[mcp_servers.gemini-offload.env]"
 Write-Host "GEMINI_OFFLOAD_REPO = ""$repoPath"""
 Write-Host "GEMINI_OFFLOAD_VERTEX_CREDENTIALS = ""$manifestConfigPath"""
 Write-Host "GOOGLE_CLOUD_LOCATION = ""$GoogleCloudLocation"""
+if ($outputDirConfigPath) {
+  Write-Host "GEMINI_OFFLOAD_OUTPUT_DIR = ""$outputDirConfigPath"""
+}
 Write-Host ""
 Write-Host "Restart Codex or open a new session after updating config.toml."
