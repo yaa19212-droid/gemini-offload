@@ -1,4 +1,4 @@
 interface:
   display_name: "Gemini Offload Workflows"
-  short_description: "Gemini offload usage and workflow guide."
-  default_prompt: "Use $gemini-offload-workflows to plan or execute a bounded Gemini offload subtask with safe output_path usage."
+  short_description: "Bounded Gemini offload workflow guide"
+  default_prompt: "Use $gemini-offload-workflows to plan a bounded plain-text Gemini offload, adding schema only if strict fields are needed."

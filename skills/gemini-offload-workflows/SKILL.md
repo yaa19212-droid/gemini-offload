@@ -1,285 +1,181 @@
 ---
 name: gemini-offload-workflows
-description: Use when Codex needs to offload a bounded multimodal subtask to the local gemini-offload MCP server, especially OCR, audio transcription, text cleanup, or file-grounded extraction. Prefer this skill when the main agent should keep its context small, when large outputs should be written to disk via output_path, when a large source should be sampled and chunked before batch processing, or when repeated prompts should be loaded from system_prompt_path or history_path.
+description: Use when Codex needs to offload a bounded Gemini subtask to the local gemini-offload MCP server, especially OCR, transcription, flexible plain-text multimodal analysis, file-grounded extraction, optional strict JSON schema output, Google Search grounding, text cleanup, or concurrent batch processing. Prefer this skill when the main agent should keep context small, large outputs should be written to disk via output_path, a source should be sampled and chunked before batch work, or reusable prompts/schemas should be loaded from path.
 ---
 
 # Gemini Offload Workflows
 
-Use `gemini-offload` as a stateless worker for one bounded subtask at a time. Keep planning, chunking, prompt design, retries, and result synthesis in the orchestrator. Let Gemini handle the heavy multimodal call, then read only the output files you actually need.
+Use `gemini-offload` as a stateless worker for bounded subtasks. Keep planning,
+chunking, retries, validation, and synthesis in the orchestrator. Let Gemini do
+the heavy multimodal or grounded call, then inspect only the receipt fields and
+saved files needed for the next decision.
 
 ## Quick Start
 
 1. Confirm the `gemini-offload` MCP server is available.
-2. Validate each input file with `detect_mime` when file type support is uncertain.
-3. Prefer `output_path` for any non-trivial response so the full result is written to disk.
-4. Use absolute paths for `files`, `output_path`, `system_prompt_path`, and `history_path`.
-5. Use `gemini_generate` for one artifact, or `gemini_generate_batch` for independent artifacts that can run concurrently.
+2. Use absolute paths for `files`, `output_path`, `system_prompt_path`,
+   `history_path`, and `response_json_schema_path`.
+3. Use `detect_mime` when file type support is uncertain.
+4. Use `gemini_generate` for one artifact and `gemini_generate_batch` for
+   independent artifacts that can run concurrently.
+5. Default to plain text output. Add JSON schema only when the task truly needs
+   a strict machine-readable contract.
+6. Prefer `output_path` for artifacts you may need to inspect later. It forces
+   file output even when the response is short.
+7. Treat `structuredContent` as authoritative. `content[0].text` is only a
+   short receipt or read guide.
 
 ## Decision Rules
 
-- Use `gemini_generate` for one self-contained subtask with clear inputs and one expected artifact.
-- Sample a large source before designing a batch plan. For PDFs, inspect a few pages first when possible. For audio, inspect duration and a short excerpt. For image sets, inspect a few representative files.
-- Use `system_prompt_path` instead of inline `system_prompt` when the prompt is long, reused, or iteratively refined.
-- Use `history_path` instead of inline `history` when few-shot examples already exist as JSON.
-- Use `list_gemini_models` before choosing a model if the task is model-sensitive or the available surface may have changed.
-- Prefer a high-quality text model for first-pass OCR or transcription pilots when output fidelity matters more than speed.
-- Model choices are intentionally narrow:
-  - `gemini-3.1-pro-preview`: best overall for complex OCR, long-context synthesis, multimodal reasoning, and hard agentic or coding tasks.
-  - `gemini-3-flash-preview`: emergency fallback when the main path is unavailable or too slow.
-  - `gemini-3.5-flash`: fast default for throughput-sensitive work; near-Pro agentic and coding capability at Flash speed, and better than 3.1 Pro on some narrower workloads.
-- Use `gemini_generate_batch` only for independent jobs with unique `output_path` values. Keep chunking, quality gates, and final aggregation in the orchestrator.
+- Shape each call as one bounded artifact: one OCR chunk, one transcript chunk,
+  one plain-text multimodal analysis, one cleanup pass, one schema extraction,
+  or one grounded answer.
+- Sample large sources before designing prompts or a batch plan.
+- Use `system_prompt_path` for long or reused instructions.
+- Use `history_path` for reusable few-shot examples.
+- Keep OCR, transcription, cleanup, and unfamiliar image/PDF analysis in plain
+  text unless downstream code needs strict fields.
+- Use `response_json_schema_path` for reusable structured extraction schemas
+  only when validation, tabulation, or automation is more important than
+  free-form adaptation.
+- Use `google_search: true` only when web grounding is part of the task.
+- Use `list_gemini_models` when model choice matters or may have changed.
+- Use `gemini_generate_batch` only for independent jobs. The tool waits for all
+  jobs, but jobs run concurrently up to `max_concurrency`.
 
-## Core Workflow
+## Response Mode Choice
 
-### 1. Shape the subtask
+Plain text and JSON schema are both first-class output modes, but they serve
+different work.
 
-Write a prompt that asks for one artifact, not a whole project. Good examples:
+- Use plain text by default for OCR, transcription, cleanup, document reading,
+  uncertain visual layouts, and exploratory multimodal analysis. This gives
+  Gemini room to preserve odd formatting, note uncertainty, and adapt to
+  unexpected source structure.
+- Use JSON schema for strict extraction, repeatable table rows, downstream
+  automation, or cases where the orchestrator must validate exact fields.
+- Do not wrap an OCR task in JSON just to make it look structured. Prefer
+  markdown or plain text when the source is irregular.
+- It is fine to combine a plain text prompt with `output_path`; file-backed
+  plain text is the normal path for large OCR and transcription artifacts.
 
-- OCR one PDF chunk into markdown
-- Transcribe one audio chunk into clean text
-- Normalize one noisy text file into a target schema
-- Extract key fields from one invoice image
+## Output Handling
 
-Avoid prompts that ask Gemini to coordinate multiple files, chunking policy, or downstream synthesis logic unless that coordination itself is the artifact you want back.
+Default policy:
 
-### 2. Choose the output strategy
+- Short text without `output_path`: full text is returned in
+  `structuredContent.text`.
+- Long text without `output_path`: text is auto-saved and the response returns
+  `text_preview`, `output_path`, `byte_count`, `line_count`, and
+  `read_guidance`.
+- Any response with `output_path`: full output is saved to that path and inline
+  fields stay compact, even when short.
+- JSON schema success returns `response_json` when short, or
+  `response_json_preview` plus `output_path` when large or manually spilled.
+- Batch applies a 4096-byte aggregate budget after all jobs finish. If compacted
+  results are still large, use `results_path` and inspect targeted sections.
 
-Prefer `output_path` when you have a natural artifact destination. If omitted,
-short responses are returned inline and larger responses are automatically
-written to the configured spill directory.
+For exact fields and edge cases, read
+`references/output-policy.md`.
 
-- With `output_path`, full text is written to disk and the inline response is only a preview, even for short responses.
-- Without `output_path`, responses over 4096 UTF-8 bytes return a preview,
-  `output_path`, and `read_guidance`.
-- Treat `structuredContent` as authoritative. `content[0].text` is only a short receipt or guide.
+## JSON Schema And Grounding
 
-Use unique output paths per subtask so repeated or staged runs do not overwrite earlier artifacts.
+Plain text is the default. Use `response_json_schema` for a small inline JSON
+Schema object, or `response_json_schema_path` for an absolute path to a JSON
+schema file, only when strict structure is useful. They are mutually exclusive.
+When a schema is present, the server switches Gemini into JSON output mode
+internally.
 
-### 3. Reuse prompt assets
+Use `google_search: true` for Google Search grounding. Grounding metadata is
+normalized for agent use; do not depend on raw Gemini UI-only fields.
 
-This repo already includes reusable OCR prompt assets under `prompts/`.
+Read `references/schema-and-grounding.md` before requiring strict JSON,
+combining JSON schema with Google Search, or designing downstream validation.
+
+## Batch Workflow
+
+For OCR, transcription, or extraction over many chunks:
+
+1. sample a few representative chunks
+2. write durable prompt files, and schema files only when strict fields are
+   needed
+3. pilot one chunk
+4. freeze the chunking and prompt policy
+5. call `gemini_generate_batch` with one independent job per chunk
+6. inspect previews, errors, and only targeted output files
+
+The batch tool is synchronous at the MCP boundary. Do not expect background
+queue behavior yet. For detailed batch receipts and budget behavior, read
+`references/batch-workflows.md`.
+
+## Prompt Assets
+
+This repo includes reusable OCR assets:
 
 - `prompts/ocr_system.md`
 - `prompts/ocr_fewshot.json`
 - `prompts/_smoke.md`
 
-When those assets match the task, pass them by absolute path instead of copying them inline. This keeps the orchestrator context small and makes repeated runs consistent. When they do not match, create task-specific prompt files and reuse those by path in later calls.
+Use these by absolute path when they match the source format. Create new prompt
+files for task-specific rules instead of copying long instructions inline.
+Create schema files only for strict extraction tasks.
 
-### 4. Inspect the tiny receipt
+## Common Call Shapes
 
-Treat the MCP response as a receipt, not the whole artifact.
-
-Check:
-
-- `model`
-- `elapsed_ms`
-- `usage`
-- `char_count`
-- `byte_count`
-- `line_count`
-- `text` or `text_preview`
-- `truncated`
-- `output_path`
-- `read_guidance`
-
-If the preview looks wrong, adjust the prompt or chunk plan before launching more similar calls.
-
-### 5. Read only what you need
-
-After a successful call, read the output file only if the next step truly needs the full content. For multi-chunk workflows, it is often enough to inspect the preview first and only open suspicious, failed, or validation-targeted outputs.
-
-## Large Input Runbook
-
-Use this runbook when the source is too large to send as one blind call, such as a long PDF, a long lecture recording, or a folder of heterogeneous images.
-
-### 1. Sample before committing
-
-Inspect a few representative slices before writing the final prompt set.
-
-- For PDFs, prefer 2-3 pages chosen from different parts of the file.
-- For audio, prefer a short excerpt from the beginning plus one more excerpt from a different section when format or speaker pattern may drift.
-- For image collections, inspect a few files that seem visually different.
-
-Goal:
-
-- infer the layout or speaking style
-- spot repeated structure
-- detect tables, headers, stamps, timestamps, speaker turns, or noise
-- decide whether one prompt is enough or multiple prompt variants are needed
-
-### 2. Design the chunking policy
-
-Choose chunk boundaries in the orchestrator, not in the Gemini prompt.
-
-Prefer chunks that are:
-
-- large enough to preserve local context
-- small enough that reruns are cheap
-- easy to name and track
-
-Useful heuristics:
-
-- For long PDFs, chunk by page ranges.
-- For long audio, chunk by duration or natural silence boundaries.
-- For many images, chunk by file groups only when they truly share the same expected output format.
-
-Default stance:
-
-- do not add overlap unless context really spills across boundaries
-- do not batch unrelated artifacts together
-- keep chunk size stable unless sampling shows clear variation
-
-Add overlap only when boundary loss is a real problem, such as a sentence, table, or speaker turn frequently crossing chunk edges.
-
-### 3. Design prompt assets for the real format
-
-After sampling, write reusable prompt files that match the actual source structure.
-
-Good prompt asset design:
-
-- keep the task narrow
-- define the exact output shape
-- say what to preserve
-- say what to ignore
-- say what not to invent
-
-Use `system_prompt_path` for durable rules and `history_path` for one or two representative examples. Keep examples short and format-focused rather than content-specific.
-
-### 4. Pilot one chunk first
-
-Before a full batch, run one representative chunk with the strongest reasonable model. For OCR or transcription quality work, start with a higher-quality model when in doubt.
-
-Pilot goals:
-
-- confirm the output format
-- confirm the prompt is specific enough
-- estimate latency and token use
-- decide whether chunk size is workable
-
-### 5. Gate on quality
-
-After the pilot, inspect both the preview and the saved artifact.
-
-If quality is good enough:
-
-- freeze the prompt assets
-- freeze the chunking policy
-- start the full run
-
-If quality is not good enough:
-
-- revise the prompt
-- revise the few-shot example
-- revise the chunk size
-- rerun one chunk before scaling out
-
-Repeat only until the results are consistently usable. Do not start a large batch while still guessing.
-
-### 6. Run the batch
-
-For multi-chunk jobs, prepare a todo list or manifest in the orchestrator and call `gemini_generate_batch` with one job per independent artifact. The server runs jobs concurrently, defaults concurrency to the configured Vertex credential count, and tracks rate limits per Vertex project/location/model quota slot. If a slot returns 429, the default `fail_fast` mode returns a structured rate-limit result; use `rate_limit_mode: "wait"` or explicit `fallback_models` only when that behavior is desired.
-
-The batch tool is synchronous at the MCP boundary, but individual jobs run
-concurrently up to `max_concurrency`. A 4096-byte aggregate inline budget is
-applied after all jobs finish. If `results_compacted` or `results_path` is
-present, follow `read_guidance` and inspect only targeted job files or manifest
-sections.
-
-Recommended per-chunk loop:
-
-1. pick the next chunk
-2. add one batch job with a unique `output_path`
-3. inspect `text_preview` and receipt fields
-4. continue only if the result still looks on-format
-5. open the saved artifact only when preview or metrics suggest a problem, or when doing periodic spot checks
-
-This pattern works well for long OCR and transcription runs because the preview gives an early signal without forcing the orchestrator to absorb the full output every time.
-
-## Common Patterns
-
-### Document OCR
-
-Use for scanned PDFs or images when the main agent should not absorb the full OCR result inline.
-
-Recommended call shape:
+OCR one chunk:
 
 ```json
 {
   "prompt": "Convert this chunk to clean markdown. Preserve headings, tables, list structure, and uncertain text markers.",
   "files": ["D:/work/input/chunk-01.pdf"],
-  "system_prompt_path": "D:/path/to/gemini-offload/prompts/ocr_system.md",
-  "history_path": "D:/path/to/gemini-offload/prompts/ocr_fewshot.json",
+  "system_prompt_path": "D:/work/gemini-offload/prompts/ocr_system.md",
+  "history_path": "D:/work/gemini-offload/prompts/ocr_fewshot.json",
   "model": "gemini-3.1-pro-preview",
   "output_path": "D:/work/out/chunk-01.md"
 }
 ```
 
-Use this when structure preservation matters more than speed.
-
-### Audio transcription or cleanup
-
-Use for MP3, WAV, FLAC, OGG, or M4A files. Ask for a concrete output shape.
-
-Example:
+Structured extraction:
 
 ```json
 {
-  "prompt": "Transcribe this chunk into clean Korean text. Preserve meaning and speaker order. Return plain text paragraphs.",
-  "files": ["D:/work/input/lecture-part-01.m4a"],
-  "model": "gemini-3.5-flash",
-  "output_path": "D:/work/out/lecture-part-01.txt"
-}
-```
-
-### Structured extraction
-
-Use Gemini to pull a bounded schema out of one file or one chunk, then keep validation in the orchestrator.
-
-Example:
-
-```json
-{
-  "prompt": "Extract the target fields and return minified JSON only.",
+  "prompt": "Extract the requested fields. Return JSON matching the schema.",
   "files": ["D:/work/input/invoice-01.png"],
+  "response_json_schema_path": "D:/work/schemas/invoice.schema.json",
   "model": "gemini-3.5-flash",
   "output_path": "D:/work/out/invoice-01.json"
 }
 ```
 
-Follow with local JSON validation or repair if needed.
-
-### Text correction or normalization
-
-Use for post-processing noisy OCR or transcripts without re-reading the original source in the main context.
-
-Example:
+Grounded short answer:
 
 ```json
 {
-  "prompt": "Rewrite this text into readable Korean while preserving factual content and order. Do not summarize.",
-  "files": ["D:/work/intermediate/raw-part-01.txt"],
-  "model": "gemini-3.5-flash",
-  "output_path": "D:/work/out/clean-part-01.txt"
+  "prompt": "Find the latest official release date and return a concise sourced answer.",
+  "google_search": true,
+  "model": "gemini-3.5-flash"
 }
 ```
 
-## Failure Modes To Watch
+## Failure Modes
 
-- Relative paths: this server requires absolute paths.
-- Missing `output_path`: large responses are auto-saved; follow `read_guidance`
-  and inspect targeted sections or ranges before reading the whole file.
-- Wrong model: the server only allows `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, and `gemini-3.5-flash`; `gemini-2.5*` IDs are blocked.
-- Over-batched orchestration: only batch independent jobs with unique output paths.
-- Starting a full run before a pilot: quality problems get multiplied across every chunk.
-- Overloaded prompt: if a prompt asks for extraction, cleanup, summarization, and formatting at once, split it into multiple subtasks instead.
+- Relative paths are rejected for file/path inputs.
+- Missing `output_path` is acceptable for short one-off answers, but larger
+  outputs spill to the configured output directory.
+- Overusing JSON schema can make OCR and unusual multimodal tasks brittle.
+  Default to plain text when the output shape is not naturally fixed.
+- JSON schema parse failures return `response_json_error` plus text fallback
+  fields.
+- Batch jobs should be independent and should use unique `output_path` values.
+- Large batch receipts may omit inline `results` and return `results_path`.
+- Do not read full output files or manifests unless the next step requires it.
 
 ## Minimal Checklist
 
-- Sample the source before designing the batch.
-- Pick one bounded subtask per call.
-- Use absolute paths everywhere.
-- Prefer `output_path`.
-- Store reusable prompt assets on disk and reference them by path.
-- Pilot one chunk before scaling out.
-- Run independent multi-chunk jobs with `gemini_generate_batch` and inspect previews before trusting the full batch.
-- Read the saved artifact only when the next step truly needs it.
+- Sample first for large sources.
+- Keep one bounded artifact per call.
+- Use absolute paths.
+- Use path-backed prompts and histories. Use schemas only for strict extraction.
+- Prefer explicit `output_path` for reusable artifacts.
+- Inspect `structuredContent`, not `content[0].text`.
+- For batch results, follow `read_guidance` and open only targeted files.
