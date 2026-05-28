@@ -900,8 +900,8 @@ class ServerOutputTests(unittest.TestCase):
             root / "plugins" / "gemini-offload" / "scripts" / "start-gemini-offload.ps1"
         ).read_text(encoding="utf-8")
 
-        self.assertNotIn("D:/work/gemini-offload", mcp_config)
-        self.assertNotIn("C:/Users/yaa19212-droid", mcp_config)
+        self.assertNotIn("D:/", mcp_config)
+        self.assertNotIn("C:/Users/", mcp_config)
         self.assertIn("./scripts/start-gemini-offload.ps1", mcp_config)
         self.assertIn("GEMINI_OFFLOAD_REPO", start_script)
         self.assertIn("GEMINI_OFFLOAD_OUTPUT_DIR", start_script)
