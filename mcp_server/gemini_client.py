@@ -88,14 +88,14 @@ class GeminiRateLimitError(RuntimeError):
     @property
     def message(self) -> str:
         fallback_note = (
-            f" Try fallback_models={self.available_fallback_models}."
+            f" Try request.rate_limit.fallback_models={self.available_fallback_models}."
             if self.available_fallback_models
             else ""
         )
         return (
             f"Vertex quota slot for {self.model} is cooling down. "
             f"Retry after about {self.retry_after_seconds:.1f} seconds, "
-            "or set rate_limit_mode='wait' to let the server wait before retrying."
+            'or set request.rate_limit.mode="wait" to let the server wait before retrying.'
             f"{fallback_note}"
         )
 
@@ -109,8 +109,8 @@ class GeminiRateLimitError(RuntimeError):
             "quota_slots": self.quota_slots,
             "available_fallback_models": self.available_fallback_models,
             "recommendation": (
-                "Retry later, set rate_limit_mode='wait', or pass fallback_models "
-                "with another supported Gemini model."
+                'Retry later, set request.rate_limit.mode="wait", or pass '
+                "request.rate_limit.fallback_models with another supported Gemini model."
             ),
         }
 
@@ -184,10 +184,10 @@ def _assert_allowed_model(model_name: str) -> None:
 
 def _normalize_rate_limit_mode(value: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ValueError("rate_limit_mode must be one of: fail_fast, wait.")
+        raise ValueError("request.rate_limit.mode must be one of: fail_fast, wait.")
     normalized = value.strip().lower()
     if normalized not in RATE_LIMIT_MODES:
-        raise ValueError("rate_limit_mode must be one of: fail_fast, wait.")
+        raise ValueError("request.rate_limit.mode must be one of: fail_fast, wait.")
     return normalized
 
 
@@ -195,9 +195,9 @@ def _normalize_rate_limit_max_wait_seconds(value: float | int | None) -> float:
     if value is None:
         return DEFAULT_RATE_LIMIT_MAX_WAIT_SECONDS
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("rate_limit_max_wait_seconds must be a non-negative number.")
+        raise ValueError("request.rate_limit.max_wait_seconds must be a non-negative number.")
     if value < 0:
-        raise ValueError("rate_limit_max_wait_seconds must be a non-negative number.")
+        raise ValueError("request.rate_limit.max_wait_seconds must be a non-negative number.")
     return float(value)
 
 
@@ -207,12 +207,12 @@ def _normalize_model_sequence(model: str, fallback_models: list[str] | None) -> 
     if fallback_models is None:
         return sequence
     if not isinstance(fallback_models, list):
-        raise ValueError("fallback_models must be an array of supported model names.")
+        raise ValueError("request.rate_limit.fallback_models must be an array of supported model names.")
 
     seen = {model}
     for idx, fallback_model in enumerate(fallback_models, start=1):
         if not isinstance(fallback_model, str) or not fallback_model.strip():
-            raise ValueError(f"fallback_models[{idx}] must be a non-empty string.")
+            raise ValueError(f"request.rate_limit.fallback_models[{idx}] must be a non-empty string.")
         normalized_model = fallback_model.strip()
         _assert_allowed_model(normalized_model)
         if normalized_model not in seen:

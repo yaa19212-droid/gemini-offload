@@ -17,6 +17,30 @@ from unittest.mock import patch
 import anyio
 
 
+def _text_request(prompt: str, *, output: dict | None = None, model: str | None = None) -> dict:
+    request: dict = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
+    }
+    if output is not None:
+        request["output"] = output
+    if model is not None:
+        request["model"] = model
+    return request
+
+
+def _text_item(item_id: str, prompt: str, *, output: dict | None = None, model: str | None = None) -> dict:
+    return {"id": item_id, "request": _text_request(prompt, output=output, model=model)}
+
+
+def _prompt_from_contents(contents: list[dict]) -> str:
+    return contents[-1]["parts"][-1]["text"]
+
+
 def _load_server_module():
     for module_name in [
         "mcp",
@@ -124,54 +148,55 @@ def _load_server_module():
 
 
 class ServerOutputTests(unittest.TestCase):
-    def test_gemini_generate_tool_schema_uses_current_default_model(self) -> None:
+    def test_call_gemini_tool_schema_replaces_old_generate_tools(self) -> None:
         server = _load_server_module()
 
         tools = server._tool_definitions()
-        gemini_generate = next(tool for tool in tools if tool.name == "gemini_generate")
-        model_schema = gemini_generate.inputSchema["properties"]["model"]
+        names = [tool.name for tool in tools]
 
-        self.assertEqual(model_schema["default"], "gemini-3.1-pro-preview")
+        self.assertIn("call_gemini", names)
+        self.assertIn("manage_gemini_run", names)
+        self.assertNotIn("gemini_generate", names)
+        self.assertNotIn("gemini_generate_batch", names)
 
-    def test_gemini_generate_tool_schema_includes_rate_limit_options(self) -> None:
+    def test_call_gemini_tool_schema_includes_explicit_and_template_shapes(self) -> None:
         server = _load_server_module()
 
         tools = server._tool_definitions()
-        gemini_generate = next(tool for tool in tools if tool.name == "gemini_generate")
-        properties = gemini_generate.inputSchema["properties"]
+        call_gemini = next(tool for tool in tools if tool.name == "call_gemini")
+        schema = call_gemini.inputSchema
 
-        self.assertEqual(properties["rate_limit_mode"]["default"], "fail_fast")
-        self.assertEqual(properties["rate_limit_mode"]["enum"], ["fail_fast", "wait"])
-        self.assertIn("fallback_models", properties)
-        self.assertEqual(properties["rate_limit_max_wait_seconds"]["default"], 120.0)
+        self.assertEqual(schema["type"], "object")
+        self.assertIn("items", schema["properties"])
+        self.assertIn("template_path", schema["properties"])
+        self.assertIn("execution", schema["properties"])
+        item_properties = schema["properties"]["items"]["items"]["properties"]
+        self.assertIn("request", item_properties)
+        self.assertIn("vars", item_properties)
 
-    def test_gemini_generate_tool_schema_includes_google_search_option(self) -> None:
+        def contains_one_of(value):
+            if isinstance(value, dict):
+                return "oneOf" in value or any(contains_one_of(child) for child in value.values())
+            if isinstance(value, list):
+                return any(contains_one_of(child) for child in value)
+            return False
+
+        self.assertFalse(contains_one_of(schema))
+
+    def test_call_gemini_tool_schema_includes_rate_limit_tools_and_json_output(self) -> None:
         server = _load_server_module()
 
         tools = server._tool_definitions()
-        gemini_generate = next(tool for tool in tools if tool.name == "gemini_generate")
-        batch_job_schema = server._batch_job_schema()
+        call_gemini = next(tool for tool in tools if tool.name == "call_gemini")
+        request_schema = call_gemini.inputSchema["properties"]["items"]["items"]["properties"]["request"]
+        properties = request_schema["properties"]
 
-        self.assertEqual(
-            gemini_generate.inputSchema["properties"]["google_search"]["default"],
-            False,
-        )
-        self.assertEqual(
-            batch_job_schema["properties"]["google_search"]["default"],
-            False,
-        )
-
-    def test_gemini_generate_tool_schema_includes_response_json_schema_options(self) -> None:
-        server = _load_server_module()
-
-        tools = server._tool_definitions()
-        gemini_generate = next(tool for tool in tools if tool.name == "gemini_generate")
-        batch_job_schema = server._batch_job_schema()
-
-        self.assertIn("response_json_schema", gemini_generate.inputSchema["properties"])
-        self.assertIn("response_json_schema_path", gemini_generate.inputSchema["properties"])
-        self.assertIn("response_json_schema", batch_job_schema["properties"])
-        self.assertIn("response_json_schema_path", batch_job_schema["properties"])
+        self.assertEqual(properties["model"]["default"], "gemini-3.1-pro-preview")
+        self.assertEqual(properties["tools"]["properties"]["google_search"]["default"], False)
+        self.assertEqual(properties["rate_limit"]["properties"]["mode"]["default"], "fail_fast")
+        self.assertEqual(properties["rate_limit"]["properties"]["mode"]["enum"], ["fail_fast", "wait"])
+        self.assertIn("json_schema", properties["output"]["properties"])
+        self.assertIn("json_schema_path", properties["output"]["properties"])
 
     def test_inline_image_output_becomes_mcp_image_content(self) -> None:
         server = _load_server_module()
@@ -460,7 +485,10 @@ class ServerOutputTests(unittest.TestCase):
             schema_path.write_text(json.dumps(schema), encoding="utf-8")
 
             self.assertEqual(server._load_json_schema(None, str(schema_path)), schema)
-            with self.assertRaisesRegex(ValueError, "Pass either response_json_schema"):
+            bom_schema_path = Path(temp_dir) / "schema-bom.json"
+            bom_schema_path.write_text(json.dumps(schema), encoding="utf-8-sig")
+            self.assertEqual(server._load_json_schema(None, str(bom_schema_path)), schema)
+            with self.assertRaisesRegex(ValueError, "Pass either output.json_schema"):
                 server._load_json_schema(schema, str(schema_path))
             with self.assertRaisesRegex(ValueError, "must be absolute"):
                 server._load_json_schema(None, "schema.json")
@@ -475,10 +503,225 @@ class ServerOutputTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "JSON object"):
                 server._load_json_schema(None, str(list_path))
 
-    def test_batch_tool_runs_jobs_concurrently(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires exactly one"):
+            server._normalize_run_plan(
+                {
+                    "items": [
+                        {
+                            "request": {
+                                "contents": [{"role": "user", "parts": [{"text": "Extract JSON."}]}],
+                                "output": {"mode": "json_schema"},
+                            }
+                        }
+                    ]
+                }
+            )
+
+    def test_template_materialization_validates_placeholders_and_paths(self) -> None:
         server = _load_server_module()
 
-        def fake_generate(*args):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "chunk.pdf"
+            input_path.write_bytes(b"%PDF")
+            template_path = root / "template.json"
+            template_path.write_text(
+                json.dumps(
+                    {
+                        "contents": [
+                            {
+                                "role": "user",
+                                "parts": [
+                                    {"file_path": "{{chunk_path}}"},
+                                    {"text": "OCR page {{page}}."},
+                                ],
+                            }
+                        ],
+                        "output": {"mode": "text", "path": str(root / "out-{{page}}.md")},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            plan = server._normalize_run_plan(
+                {
+                    "template_path": str(template_path),
+                    "items": [{"id": "p1", "vars": {"chunk_path": str(input_path), "page": 1}}],
+                }
+            )
+
+            request = plan["items"][0]["request"]
+            self.assertEqual(request["contents"][0]["parts"][0]["file_path"], str(input_path))
+            self.assertEqual(request["contents"][0]["parts"][1]["text"], "OCR page 1.")
+            self.assertEqual(request["output_path"], str(root / "out-1.md"))
+
+            bom_template_path = root / "template-bom.json"
+            bom_template_path.write_text(template_path.read_text(encoding="utf-8"), encoding="utf-8-sig")
+            bom_plan = server._normalize_run_plan(
+                {
+                    "template_path": str(bom_template_path),
+                    "items": [{"id": "p1", "vars": {"chunk_path": str(input_path), "page": 1}}],
+                }
+            )
+            self.assertEqual(bom_plan["items"][0]["request"]["output_path"], str(root / "out-1.md"))
+
+            with self.assertRaisesRegex(ValueError, "Missing template var"):
+                server._normalize_run_plan(
+                    {
+                        "template_path": str(template_path),
+                        "items": [{"id": "p1", "vars": {"chunk_path": str(input_path)}}],
+                    }
+                )
+
+            with self.assertRaisesRegex(ValueError, "Unused template vars"):
+                server._normalize_run_plan(
+                    {
+                        "template_path": str(template_path),
+                        "items": [
+                            {
+                                "id": "p1",
+                                "vars": {"chunk_path": str(input_path), "page": 1, "unused": "x"},
+                            }
+                        ],
+                    }
+                )
+
+            with self.assertRaisesRegex(ValueError, "Invalid placeholder name"):
+                server._normalize_run_plan(
+                    {
+                        "template_path": str(template_path),
+                        "items": [
+                            {
+                                "id": "p1",
+                                "vars": {"chunk_path": str(input_path), "page": 1, "bad/name": "x"},
+                            }
+                        ],
+                    }
+                )
+
+    def test_background_call_returns_receipt_and_persists_run_files(self) -> None:
+        server = _load_server_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            def fake_spawn(run_dir, run_id, run_token):
+                locator = {"run_id": run_id, "pid": 12345, "create_time": 1.0, "run_token": run_token}
+                server._write_json(Path(run_dir) / "locator.json", locator)
+                return locator
+
+            async def run_call():
+                with patch.dict(os.environ, {server.ENV_RUN_DIR: temp_dir}, clear=False):
+                    with patch.object(server, "_spawn_worker", fake_spawn):
+                        return await server.handle_call_tool(
+                            "call_gemini",
+                            {
+                                "execution": {"lifecycle": "background", "max_concurrency": 2},
+                                "items": [_text_item("p1", "OCR this.")],
+                            },
+                        )
+
+            wrapped = anyio.run(run_call)
+            data = wrapped.structuredContent
+            run_dir = Path(data["run_dir"])
+
+            self.assertEqual(data["lifecycle"], "background")
+            self.assertEqual(data["status"], "running")
+            self.assertTrue((run_dir / "plan.json").exists())
+            self.assertTrue((run_dir / "status.json").exists())
+            self.assertTrue((run_dir / "events.jsonl").exists())
+            self.assertTrue((run_dir / "locator.json").exists())
+            plan = json.loads((run_dir / "plan.json").read_text(encoding="utf-8"))
+            self.assertTrue(plan["items"][0]["request"]["output_path"].endswith("outputs\\p1.txt") or plan["items"][0]["request"]["output_path"].endswith("outputs/p1.txt"))
+            self.assertEqual(
+                wrapped.content[0].text,
+                "Background Gemini run started. Use structuredContent paths and manage_gemini_run for progress.",
+            )
+
+    def test_background_worker_writes_outputs_status_and_progress_events(self) -> None:
+        server = _load_server_module()
+
+        def fake_generate_request(*args):
+            return {
+                "text": "worker result",
+                "model": "gemini-3.5-flash",
+                "usage": {},
+                "elapsed_ms": 1,
+                "images": [],
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(os.environ, {server.ENV_RUN_DIR: temp_dir}, clear=False):
+                plan = server._normalize_run_plan(
+                    {
+                        "execution": {"lifecycle": "background"},
+                        "items": [_text_item("p1", "OCR this.")],
+                    }
+                )
+                run_dir = Path(plan["run_dir"])
+                run_dir.mkdir(parents=True, exist_ok=True)
+                (run_dir / "control").mkdir(parents=True, exist_ok=True)
+                (run_dir / "outputs").mkdir(parents=True, exist_ok=True)
+                server._write_json(run_dir / "plan.json", plan)
+                server._write_json(
+                    run_dir / "locator.json",
+                    {"run_id": plan["run_id"], "run_token": "token", "pid": 1},
+                )
+
+                with patch.object(server, "generate_request", fake_generate_request):
+                    anyio.run(server.run_worker_from_dir, str(run_dir), plan["run_id"], "token")
+
+                status = server._manage_gemini_run({"action": "status", "run_dir": str(run_dir)})
+                progress = server._manage_gemini_run({"action": "progress", "run_dir": str(run_dir)})
+                listed = server._manage_gemini_run({"action": "list"})
+
+            output_path = Path(plan["items"][0]["request"]["output_path"])
+            self.assertEqual(output_path.read_text(encoding="utf-8"), "worker result")
+            self.assertEqual(status["status"], "completed")
+            self.assertEqual(status["ok_count"], 1)
+            self.assertFalse(status["process_alive"])
+            self.assertGreaterEqual(len(progress["events"]), 3)
+            self.assertEqual(progress["next_event_offset"], len(progress["events"]))
+            self.assertIn(plan["run_id"], [run["run_id"] for run in listed["runs"]])
+
+    def test_manage_gemini_run_stop_cancel_and_resume_write_control_and_spawn(self) -> None:
+        server = _load_server_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(os.environ, {server.ENV_RUN_DIR: temp_dir}, clear=False):
+                plan = server._normalize_run_plan(
+                    {
+                        "execution": {"lifecycle": "background"},
+                        "items": [_text_item("p1", "OCR this.")],
+                    }
+                )
+                run_dir = Path(plan["run_dir"])
+                run_dir.mkdir(parents=True, exist_ok=True)
+                (run_dir / "control").mkdir(parents=True, exist_ok=True)
+                server._write_json(run_dir / "plan.json", plan)
+                server._write_status(run_dir, server._initial_status(plan, "running"))
+
+                stop_result = server._manage_gemini_run({"action": "stop", "run_dir": str(run_dir)})
+                self.assertTrue(Path(stop_result["control_path"]).exists())
+
+                cancel_result = server._manage_gemini_run({"action": "cancel", "run_dir": str(run_dir)})
+                self.assertTrue(Path(cancel_result["control_path"]).exists())
+
+                def fake_spawn(run_dir_arg, run_id, run_token):
+                    locator = {"run_id": run_id, "pid": 5678, "create_time": 1.0, "run_token": run_token}
+                    server._write_json(Path(run_dir_arg) / "locator.json", locator)
+                    return locator
+
+                with patch.object(server, "_spawn_worker", fake_spawn):
+                    resume_result = server._manage_gemini_run({"action": "resume", "run_dir": str(run_dir)})
+
+                self.assertEqual(resume_result["status"], "running")
+                self.assertEqual(resume_result["pid"], 5678)
+                self.assertFalse((run_dir / "control" / "stop.json").exists())
+                self.assertFalse((run_dir / "control" / "cancel.json").exists())
+
+    def test_call_gemini_runs_items_concurrently(self) -> None:
+        server = _load_server_module()
+
+        def fake_generate_request(*args):
             time.sleep(0.2)
             return {
                 "text": "ok",
@@ -488,35 +731,36 @@ class ServerOutputTests(unittest.TestCase):
                 "images": [],
             }
 
-        async def run_batch():
-            with patch.object(server, "generate", fake_generate):
+        async def run_call():
+            with patch.object(server, "generate_request", fake_generate_request):
                 started_at = time.perf_counter()
                 wrapped = await server.handle_call_tool(
-                    "gemini_generate_batch",
+                    "call_gemini",
                     {
-                        "max_concurrency": 2,
-                        "jobs": [
-                            {"id": "a", "prompt": "one"},
-                            {"id": "b", "prompt": "two"},
+                        "execution": {"max_concurrency": 2},
+                        "items": [
+                            _text_item("a", "one"),
+                            _text_item("b", "two"),
                         ],
                     },
                 )
                 elapsed = time.perf_counter() - started_at
             return wrapped, elapsed
 
-        wrapped, elapsed = anyio.run(run_batch)
+        wrapped, elapsed = anyio.run(run_call)
 
         self.assertLess(elapsed, 0.35)
-        self.assertEqual(wrapped.structuredContent["job_count"], 2)
+        self.assertEqual(wrapped.structuredContent["item_count"], 2)
         self.assertEqual(wrapped.structuredContent["ok_count"], 2)
         self.assertEqual([item["id"] for item in wrapped.structuredContent["results"]], ["a", "b"])
-        self.assertEqual(wrapped.content[0].text, "Batch result returned in structuredContent.")
+        self.assertEqual(wrapped.content[0].text, "Gemini run returned in structuredContent.")
         self.assertNotIn('"results"', wrapped.content[0].text)
 
-    def test_batch_aggregate_budget_spills_success_text_jobs(self) -> None:
+    def test_run_aggregate_budget_spills_success_text_items(self) -> None:
         server = _load_server_module()
 
-        def fake_generate(prompt, *args):
+        def fake_generate_request(contents, *args):
+            prompt = _prompt_from_contents(contents)
             return {
                 "text": f"{prompt}-" + ("x" * 900),
                 "model": "gemini-3.5-flash",
@@ -525,13 +769,13 @@ class ServerOutputTests(unittest.TestCase):
                 "images": [],
             }
 
-        async def run_batch():
-            with patch.object(server, "generate", fake_generate):
+        async def run_call():
+            with patch.object(server, "generate_request", fake_generate_request):
                 return await server.handle_call_tool(
-                    "gemini_generate_batch",
+                    "call_gemini",
                     {
-                        "jobs": [
-                            {"id": f"job-{index}", "prompt": f"job-{index}"}
+                        "items": [
+                            _text_item(f"job-{index}", f"job-{index}")
                             for index in range(5)
                         ],
                     },
@@ -539,7 +783,7 @@ class ServerOutputTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict(os.environ, {server.ENV_OUTPUT_DIR: temp_dir}, clear=False):
-                wrapped = anyio.run(run_batch)
+                wrapped = anyio.run(run_call)
 
             data = wrapped.structuredContent
             self.assertTrue(data["results_compacted"])
@@ -550,10 +794,10 @@ class ServerOutputTests(unittest.TestCase):
             )
             self.assertEqual(data["ok_count"], 5)
             self.assertEqual(len(data["results"]), 5)
-            self.assertIn("Successful job outputs were saved", data["read_guidance"])
+            self.assertIn("Successful item outputs were saved", data["read_guidance"])
             self.assertEqual(
                 wrapped.content[0].text,
-                "Batch result returned in structuredContent. Follow read_guidance before reading output files.",
+                "Gemini run returned in structuredContent. Follow read_guidance before reading output files.",
             )
             for result in data["results"]:
                 self.assertTrue(result["ok"])
@@ -564,10 +808,11 @@ class ServerOutputTests(unittest.TestCase):
                 self.assertEqual(output_path.suffix, ".txt")
                 self.assertTrue(output_path.read_text(encoding="utf-8").startswith(result["id"]))
 
-    def test_batch_aggregate_budget_spills_success_json_jobs(self) -> None:
+    def test_run_aggregate_budget_spills_success_json_items(self) -> None:
         server = _load_server_module()
 
-        def fake_generate(prompt, *args):
+        def fake_generate_request(contents, *args):
+            prompt = _prompt_from_contents(contents)
             return {
                 "text": json.dumps({"id": prompt, "value": "x" * 900}),
                 "model": "gemini-3.5-flash",
@@ -576,17 +821,17 @@ class ServerOutputTests(unittest.TestCase):
                 "images": [],
             }
 
-        async def run_batch():
-            with patch.object(server, "generate", fake_generate):
+        async def run_call():
+            with patch.object(server, "generate_request", fake_generate_request):
                 return await server.handle_call_tool(
-                    "gemini_generate_batch",
+                    "call_gemini",
                     {
-                        "jobs": [
-                            {
-                                "id": f"json-{index}",
-                                "prompt": f"json-{index}",
-                                "response_json_schema": {"type": "object"},
-                            }
+                        "items": [
+                            _text_item(
+                                f"json-{index}",
+                                f"json-{index}",
+                                output={"mode": "json_schema", "json_schema": {"type": "object"}},
+                            )
                             for index in range(5)
                         ],
                     },
@@ -594,7 +839,7 @@ class ServerOutputTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict(os.environ, {server.ENV_OUTPUT_DIR: temp_dir}, clear=False):
-                wrapped = anyio.run(run_batch)
+                wrapped = anyio.run(run_call)
 
             data = wrapped.structuredContent
             self.assertTrue(data["results_compacted"])
@@ -607,10 +852,11 @@ class ServerOutputTests(unittest.TestCase):
                 self.assertEqual(output_path.suffix, ".json")
                 self.assertEqual(json.loads(output_path.read_text(encoding="utf-8"))["id"], result["id"])
 
-    def test_batch_aggregate_budget_writes_manifest_when_compacted_results_are_large(self) -> None:
+    def test_run_aggregate_budget_writes_manifest_when_compacted_results_are_large(self) -> None:
         server = _load_server_module()
 
-        def fake_generate(prompt, *args):
+        def fake_generate_request(contents, *args):
+            prompt = _prompt_from_contents(contents)
             return {
                 "text": f"{prompt}-" + ("x" * 500),
                 "model": "gemini-3.5-flash",
@@ -619,13 +865,13 @@ class ServerOutputTests(unittest.TestCase):
                 "images": [],
             }
 
-        async def run_batch():
-            with patch.object(server, "generate", fake_generate):
+        async def run_call():
+            with patch.object(server, "generate_request", fake_generate_request):
                 return await server.handle_call_tool(
-                    "gemini_generate_batch",
+                    "call_gemini",
                     {
-                        "jobs": [
-                            {"id": f"job-{index}", "prompt": f"job-{index}"}
+                        "items": [
+                            _text_item(f"job-{index}", f"job-{index}")
                             for index in range(30)
                         ],
                     },
@@ -633,7 +879,7 @@ class ServerOutputTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict(os.environ, {server.ENV_OUTPUT_DIR: temp_dir}, clear=False):
-                wrapped = anyio.run(run_batch)
+                wrapped = anyio.run(run_call)
 
             data = wrapped.structuredContent
             self.assertTrue(data["results_compacted"])
@@ -646,15 +892,16 @@ class ServerOutputTests(unittest.TestCase):
             )
             results_path = Path(data["results_path"])
             self.assertEqual(results_path.parent, Path(temp_dir).resolve())
-            self.assertTrue(results_path.name.startswith("batch-results-"))
+            self.assertTrue(results_path.name.startswith("run-results-"))
             manifest = json.loads(results_path.read_text(encoding="utf-8"))
             self.assertEqual(len(manifest["results"]), 30)
-            self.assertIn("Full compacted batch results were saved", data["read_guidance"])
+            self.assertIn("Full compacted run results were saved", data["read_guidance"])
 
-    def test_batch_compaction_force_spills_invalid_json_schema_text(self) -> None:
+    def test_run_compaction_force_spills_invalid_json_schema_text(self) -> None:
         server = _load_server_module()
 
-        def fake_generate(prompt, *args):
+        def fake_generate_request(contents, *args):
+            prompt = _prompt_from_contents(contents)
             return {
                 "text": f"{{not-json-{prompt}-" + ("x" * 900),
                 "model": "gemini-3.5-flash",
@@ -663,17 +910,17 @@ class ServerOutputTests(unittest.TestCase):
                 "images": [],
             }
 
-        async def run_batch():
-            with patch.object(server, "generate", fake_generate):
+        async def run_call():
+            with patch.object(server, "generate_request", fake_generate_request):
                 return await server.handle_call_tool(
-                    "gemini_generate_batch",
+                    "call_gemini",
                     {
-                        "jobs": [
-                            {
-                                "id": f"bad-json-{index}",
-                                "prompt": f"bad-json-{index}",
-                                "response_json_schema": {"type": "object"},
-                            }
+                        "items": [
+                            _text_item(
+                                f"bad-json-{index}",
+                                f"bad-json-{index}",
+                                output={"mode": "json_schema", "json_schema": {"type": "object"}},
+                            )
                             for index in range(5)
                         ],
                     },
@@ -681,7 +928,7 @@ class ServerOutputTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict(os.environ, {server.ENV_OUTPUT_DIR: temp_dir}, clear=False):
-                wrapped = anyio.run(run_batch)
+                wrapped = anyio.run(run_call)
 
             data = wrapped.structuredContent
             self.assertTrue(data["results_compacted"])
@@ -695,10 +942,11 @@ class ServerOutputTests(unittest.TestCase):
                 self.assertEqual(output_path.suffix, ".txt")
                 self.assertTrue(output_path.read_text(encoding="utf-8").startswith("{not-json-"))
 
-    def test_batch_compaction_reuses_already_spilled_job_outputs(self) -> None:
+    def test_run_compaction_reuses_already_spilled_item_outputs(self) -> None:
         server = _load_server_module()
 
-        def fake_generate(prompt, *args):
+        def fake_generate_request(contents, *args):
+            prompt = _prompt_from_contents(contents)
             return {
                 "text": f"{prompt}-" + ("x" * server.INLINE_OUTPUT_BYTE_LIMIT),
                 "model": "gemini-3.5-flash",
@@ -707,13 +955,13 @@ class ServerOutputTests(unittest.TestCase):
                 "images": [],
             }
 
-        async def run_batch():
-            with patch.object(server, "generate", fake_generate):
+        async def run_call():
+            with patch.object(server, "generate_request", fake_generate_request):
                 return await server.handle_call_tool(
-                    "gemini_generate_batch",
+                    "call_gemini",
                     {
-                        "jobs": [
-                            {"id": f"job-{index}", "prompt": f"job-{index}"}
+                        "items": [
+                            _text_item(f"job-{index}", f"job-{index}")
                             for index in range(10)
                         ],
                     },
@@ -721,11 +969,11 @@ class ServerOutputTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict(os.environ, {server.ENV_OUTPUT_DIR: temp_dir}, clear=False):
-                wrapped = anyio.run(run_batch)
+                wrapped = anyio.run(run_call)
 
             data = wrapped.structuredContent
             result_files = sorted(path for path in Path(temp_dir).iterdir() if path.name.startswith("response-"))
-            manifest_files = sorted(path for path in Path(temp_dir).iterdir() if path.name.startswith("batch-results-"))
+            manifest_files = sorted(path for path in Path(temp_dir).iterdir() if path.name.startswith("run-results-"))
             self.assertEqual(len(result_files), 10)
             self.assertLessEqual(len(manifest_files), 1)
             if data.get("results_omitted"):
@@ -738,10 +986,11 @@ class ServerOutputTests(unittest.TestCase):
                 result_files,
             )
 
-    def test_batch_aggregate_budget_preserves_inline_error_jobs(self) -> None:
+    def test_run_aggregate_budget_preserves_inline_error_items(self) -> None:
         server = _load_server_module()
 
-        def fake_generate(prompt, *args):
+        def fake_generate_request(contents, *args):
+            prompt = _prompt_from_contents(contents)
             if prompt == "bad":
                 raise server.GeminiRateLimitError(
                     model="gemini-3.5-flash",
@@ -757,22 +1006,22 @@ class ServerOutputTests(unittest.TestCase):
                 "images": [],
             }
 
-        async def run_batch():
-            with patch.object(server, "generate", fake_generate):
+        async def run_call():
+            with patch.object(server, "generate_request", fake_generate_request):
                 return await server.handle_call_tool(
-                    "gemini_generate_batch",
+                    "call_gemini",
                     {
-                        "jobs": [
-                            {"id": f"job-{index}", "prompt": f"job-{index}"}
+                        "items": [
+                            _text_item(f"job-{index}", f"job-{index}")
                             for index in range(4)
                         ]
-                        + [{"id": "bad", "prompt": "bad", "model": "gemini-3.5-flash"}],
+                        + [_text_item("bad", "bad", model="gemini-3.5-flash")],
                     },
                 )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict(os.environ, {server.ENV_OUTPUT_DIR: temp_dir}, clear=False):
-                wrapped = anyio.run(run_batch)
+                wrapped = anyio.run(run_call)
 
             data = wrapped.structuredContent
             self.assertEqual(data["ok_count"], 4)
@@ -786,13 +1035,11 @@ class ServerOutputTests(unittest.TestCase):
         server = _load_server_module()
         observed: list[bool] = []
 
-        def fake_generate(
-            prompt,
-            files,
+        def fake_generate_request(
+            contents,
             system_prompt,
             model,
             include_thinking,
-            history,
             rate_limit_mode,
             fallback_models,
             rate_limit_max_wait_seconds,
@@ -809,26 +1056,37 @@ class ServerOutputTests(unittest.TestCase):
             }
 
         async def run_generate():
-            with patch.object(server, "generate", fake_generate):
+            with patch.object(server, "generate_request", fake_generate_request):
                 return await server.handle_call_tool(
-                    "gemini_generate",
+                    "call_gemini",
                     {
-                        "prompt": "one",
-                        "google_search": True,
-                        "response_json_schema": {"type": "object"},
+                        "items": [
+                            {
+                                "id": "one",
+                                "request": {
+                                    **_text_request(
+                                        "one",
+                                        output={"mode": "json_schema", "json_schema": {"type": "object"}},
+                                    ),
+                                    "tools": {"google_search": True},
+                                },
+                            }
+                        ],
+                        "execution": {"lifecycle": "blocking"},
                     },
                 )
 
         wrapped = anyio.run(run_generate)
 
         self.assertEqual(observed, [(True, {"type": "object"})])
-        self.assertEqual(wrapped.structuredContent["response_json_error"].split(":", 1)[0], "JSONDecodeError")
-        self.assertEqual(wrapped.structuredContent["text"], "ok")
+        result = wrapped.structuredContent["results"][0]
+        self.assertEqual(result["response_json_error"].split(":", 1)[0], "JSONDecodeError")
+        self.assertEqual(result["text"], "ok")
 
-    def test_single_generate_returns_structured_rate_limit_result(self) -> None:
+    def test_call_gemini_returns_rate_limit_as_item_result(self) -> None:
         server = _load_server_module()
 
-        def fake_generate(*args):
+        def fake_generate_request(*args):
             raise server.GeminiRateLimitError(
                 model="gemini-3.5-flash",
                 attempted_models=["gemini-3.5-flash"],
@@ -837,22 +1095,24 @@ class ServerOutputTests(unittest.TestCase):
             )
 
         async def run_generate():
-            with patch.object(server, "generate", fake_generate):
+            with patch.object(server, "generate_request", fake_generate_request):
                 return await server.handle_call_tool(
-                    "gemini_generate",
-                    {"prompt": "one", "model": "gemini-3.5-flash"},
+                    "call_gemini",
+                    {"items": [_text_item("one", "one", model="gemini-3.5-flash")]},
                 )
 
         wrapped = anyio.run(run_generate)
 
-        self.assertTrue(wrapped.isError)
-        self.assertEqual(wrapped.structuredContent["error_type"], "vertex_rate_limited")
-        self.assertEqual(wrapped.structuredContent["retry_after_seconds"], 9.0)
+        self.assertFalse(wrapped.isError)
+        result = wrapped.structuredContent["results"][0]
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_type"], "vertex_rate_limited")
+        self.assertEqual(result["retry_after_seconds"], 9.0)
 
-    def test_batch_tool_keeps_rate_limit_as_per_job_error(self) -> None:
+    def test_call_gemini_keeps_rate_limit_as_per_item_error(self) -> None:
         server = _load_server_module()
 
-        def fake_generate(*args):
+        def fake_generate_request(*args):
             raise server.GeminiRateLimitError(
                 model="gemini-3.5-flash",
                 attempted_models=["gemini-3.5-flash"],
@@ -860,18 +1120,18 @@ class ServerOutputTests(unittest.TestCase):
                 quota_slots=["project1/global/gemini-3.5-flash"],
             )
 
-        async def run_batch():
-            with patch.object(server, "generate", fake_generate):
+        async def run_call():
+            with patch.object(server, "generate_request", fake_generate_request):
                 return await server.handle_call_tool(
-                    "gemini_generate_batch",
+                    "call_gemini",
                     {
-                        "jobs": [
-                            {"id": "a", "prompt": "one", "model": "gemini-3.5-flash"},
+                        "items": [
+                            _text_item("a", "one", model="gemini-3.5-flash"),
                         ],
                     },
                 )
 
-        wrapped = anyio.run(run_batch)
+        wrapped = anyio.run(run_call)
 
         result = wrapped.structuredContent["results"][0]
         self.assertFalse(result["ok"])

@@ -11,14 +11,16 @@ grounded call, then inspect only receipts, status fields, and targeted files.
 
 ## Quick Start
 
-1. Confirm `call_gemini`, `manage_gemini_run`, `list_gemini_models`, and
-   `detect_mime` are available.
-2. Use absolute paths for file, text, schema, template, output, and run paths.
-3. Default to plain text output. Use JSON schema only when exact fields matter.
-4. Use one `call_gemini` item for a bounded artifact, or multiple items with
+1. Use `call_gemini` for the Gemini run.
+2. Use `list_gemini_models` or `detect_mime` only when model choice or file
+   support is uncertain.
+3. Use `manage_gemini_run` after starting a background run.
+4. Use absolute paths for file, text, schema, template, output, and run paths.
+5. Default to plain text output. Use JSON schema only when exact fields matter.
+6. Use one `call_gemini` item for a bounded artifact, or multiple items with
    `max_concurrency` for independent artifacts.
-5. Use `execution.lifecycle: "background"` for long OCR/transcription runs.
-6. Treat `structuredContent` as authoritative. `content[0].text` is only a
+7. Use `execution.lifecycle: "background"` for long OCR/transcription runs.
+8. Treat `structuredContent` as authoritative. `content[0].text` is only a
    short receipt or read guide.
 
 ## Request Model
@@ -77,7 +79,14 @@ Plain text and JSON schema are both first-class output modes.
 - Background starts return `run_id`, `run_dir`, `status_path`, `events_path`,
   and guidance. Use `manage_gemini_run` for progress.
 
-For details, read `references/output-policy.md`.
+## Read References When Needed
+
+- Read `references/schema-and-grounding.md` for JSON schema or Google Search
+  grounding.
+- Read `references/batch-workflows.md` for multi-item, template, or background
+  runs.
+- Read `references/output-policy.md` when interpreting spills, previews,
+  manifests, or `read_guidance`.
 
 ## Background Runs
 

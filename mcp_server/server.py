@@ -58,6 +58,10 @@ PLACEHOLDER_ALLOWED_PUNCTUATION = set("_-.()[]@+=,~ ")
 PLACEHOLDER_FORBIDDEN_CHARS = set('<>:"/\\|?*{}')
 
 
+class WorkerOwnershipLost(RuntimeError):
+    """Raised when a background worker is no longer the active run owner."""
+
+
 def _load_json_schema(inline: Any, path: Any) -> Any:
     if path is None:
         if inline is None:
@@ -120,11 +124,26 @@ def _new_run_id() -> str:
 
 def _write_json(path: pathlib.Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def _read_json(path: pathlib.Path) -> dict[str, Any]:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path} contains invalid JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise ValueError(f"{path} must contain a JSON object.")
     return data
@@ -140,6 +159,26 @@ def _append_event(run_dir: pathlib.Path, event: dict[str, Any]) -> None:
     events_path.parent.mkdir(parents=True, exist_ok=True)
     with events_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event_payload, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _locator_matches_worker(run_dir: pathlib.Path, run_id: str, run_token: str) -> bool:
+    locator_path = run_dir / "locator.json"
+    if not locator_path.exists():
+        return False
+    try:
+        locator = _read_json(locator_path)
+    except Exception:
+        return False
+    return locator.get("run_id") == run_id and locator.get("run_token") == run_token
+
+
+def _ensure_worker_owns_run(run_dir: pathlib.Path | None, run_id: str, run_token: str | None) -> None:
+    if run_dir is None or run_token is None:
+        return
+    if not _locator_matches_worker(run_dir, run_id, run_token):
+        raise WorkerOwnershipLost(f"Worker no longer owns run {run_id}.")
 
 
 def _new_auto_output_path(extension: str, *, prefix: str = "response") -> pathlib.Path:
@@ -897,15 +936,17 @@ async def _execute_run_plan(
     *,
     run_dir: pathlib.Path | None = None,
     background: bool = False,
+    worker_token: str | None = None,
 ) -> dict[str, Any]:
     max_concurrency = plan["max_concurrency"]
     limiter = anyio.Semaphore(max_concurrency)
     results: list[dict[str, Any] | None] = [None] * len(plan["items"])
-    raw_successes: list[dict[str, Any] | None] = [None] * len(plan["items"])
+    raw_successes: list[dict[str, Any] | None] | None = None if background else [None] * len(plan["items"])
     status_lock = anyio.Lock()
     status_data = _initial_status(plan, "running") if background and run_dir is not None else None
 
     if status_data is not None:
+        _ensure_worker_owns_run(run_dir, plan["run_id"], worker_token)
         existing_status_path = run_dir / "status.json"
         if existing_status_path.exists():
             try:
@@ -920,6 +961,7 @@ async def _execute_run_plan(
         if status_data is None or run_dir is None:
             return
         async with status_lock:
+            _ensure_worker_owns_run(run_dir, plan["run_id"], worker_token)
             item_entry = status_data["items"][index]
             item_entry["status"] = item_status
             if extra:
@@ -946,6 +988,7 @@ async def _execute_run_plan(
             }
             return
         async with limiter:
+            _ensure_worker_owns_run(run_dir, plan["run_id"], worker_token)
             if run_dir is not None:
                 control_action = _read_control_action(run_dir)
                 if control_action in {"stop", "cancel"}:
@@ -962,14 +1005,17 @@ async def _execute_run_plan(
 
             await update_item_status(index, "running", {"started_at": _utc_now()})
             if run_dir is not None:
+                _ensure_worker_owns_run(run_dir, plan["run_id"], worker_token)
                 _append_event(run_dir, {"run_id": plan["run_id"], "event": "item_started", "item_id": item["id"]})
             try:
                 raw_result, expect_json_response = await _generate_raw_from_request(item["request"])
-                raw_successes[index] = {
-                    "result": raw_result,
-                    "output_path": item["request"].get("output_path"),
-                    "expect_json_response": expect_json_response,
-                }
+                _ensure_worker_owns_run(run_dir, plan["run_id"], worker_token)
+                if raw_successes is not None:
+                    raw_successes[index] = {
+                        "result": raw_result,
+                        "output_path": item["request"].get("output_path"),
+                        "expect_json_response": expect_json_response,
+                    }
                 item_result = _apply_output_policy(
                     dict(raw_result),
                     item["request"].get("output_path"),
@@ -978,7 +1024,23 @@ async def _execute_run_plan(
                 item_result["index"] = index
                 item_result["id"] = item["id"]
                 item_result["ok"] = True
-                results[index] = item_result
+                if background:
+                    results[index] = {
+                        key: item_result[key]
+                        for key in (
+                            "index",
+                            "id",
+                            "ok",
+                            "output_path",
+                            "char_count",
+                            "byte_count",
+                            "line_count",
+                            "image_count",
+                        )
+                        if key in item_result
+                    }
+                else:
+                    results[index] = item_result
                 await update_item_status(
                     index,
                     "completed",
@@ -988,6 +1050,7 @@ async def _execute_run_plan(
                     },
                 )
                 if run_dir is not None:
+                    _ensure_worker_owns_run(run_dir, plan["run_id"], worker_token)
                     _append_event(
                         run_dir,
                         {
@@ -997,6 +1060,8 @@ async def _execute_run_plan(
                             "output_path": item_result.get("output_path"),
                         },
                     )
+            except WorkerOwnershipLost:
+                raise
             except GeminiRateLimitError as exc:
                 error_result = exc.to_dict()
                 error_result.update({"index": index, "id": item["id"], "ok": False, "error": exc.message})
@@ -1030,6 +1095,7 @@ async def _execute_run_plan(
                     )
 
     if run_dir is not None:
+        _ensure_worker_owns_run(run_dir, plan["run_id"], worker_token)
         _append_event(run_dir, {"run_id": plan["run_id"], "event": "run_started"})
 
     async with anyio.create_task_group() as task_group:
@@ -1041,18 +1107,31 @@ async def _execute_run_plan(
     error_count = len(finalized_results) - ok_count
     run_status = "completed" if error_count == 0 else "failed"
     if run_dir is not None:
+        _ensure_worker_owns_run(run_dir, plan["run_id"], worker_token)
         control_action = _read_control_action(run_dir)
         if control_action == "cancel":
             run_status = "canceled"
         elif control_action == "stop":
             run_status = "stopped"
         if status_data is not None:
+            _ensure_worker_owns_run(run_dir, plan["run_id"], worker_token)
             status_data["status"] = run_status
             status_data["completed_count"] = len(finalized_results)
             status_data["ok_count"] = ok_count
             status_data["error_count"] = error_count
             _write_status(run_dir, status_data)
         _append_event(run_dir, {"run_id": plan["run_id"], "event": f"run_{run_status}"})
+
+    if background:
+        return {
+            "run_id": plan["run_id"],
+            "lifecycle": plan["lifecycle"],
+            "item_count": len(plan["items"]),
+            "ok_count": ok_count,
+            "error_count": error_count,
+            "max_concurrency": max_concurrency,
+            "results": finalized_results,
+        }
 
     return _apply_run_aggregate_policy(
         {
@@ -1064,7 +1143,7 @@ async def _execute_run_plan(
             "max_concurrency": max_concurrency,
             "results": finalized_results,
         },
-        raw_successes,
+        raw_successes or [None] * len(plan["items"]),
     )
 
 
@@ -1074,8 +1153,8 @@ def _call_gemini_input_schema() -> dict[str, Any]:
         "description": "Content part. Set exactly one of text, text_path, or file_path.",
         "properties": {
             "text": {"type": "string"},
-            "text_path": {"type": "string"},
-            "file_path": {"type": "string"},
+            "text_path": {"type": "string", "description": "Absolute path to a UTF-8 text file."},
+            "file_path": {"type": "string", "description": "Absolute path to a local file part."},
         },
         "additionalProperties": False,
     }
@@ -1096,7 +1175,10 @@ def _call_gemini_input_schema() -> dict[str, Any]:
             "system": {
                 "type": "object",
                 "description": "Optional system instruction. Set exactly one of text or path.",
-                "properties": {"text": {"type": "string"}, "path": {"type": "string"}},
+                "properties": {
+                    "text": {"type": "string"},
+                    "path": {"type": "string", "description": "Absolute path to a UTF-8 system prompt file."},
+                },
                 "additionalProperties": False,
             },
             "contents": {"type": "array", "items": content_schema, "minItems": 1},
@@ -1104,9 +1186,15 @@ def _call_gemini_input_schema() -> dict[str, Any]:
                 "type": "object",
                 "properties": {
                     "mode": {"type": "string", "enum": ["text", "json_schema"], "default": "text"},
-                    "path": {"type": "string"},
-                    "json_schema": {"type": "object"},
-                    "json_schema_path": {"type": "string"},
+                    "path": {"type": "string", "description": "Absolute output path. Forces file-backed output when set."},
+                    "json_schema": {
+                        "type": "object",
+                        "description": "Inline JSON Schema object. Only valid with output.mode: json_schema.",
+                    },
+                    "json_schema_path": {
+                        "type": "string",
+                        "description": "Absolute path to a JSON Schema file. Only valid with output.mode: json_schema.",
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -1343,18 +1431,47 @@ def _verified_process_from_locator(locator: dict[str, Any]) -> psutil.Process | 
 
 def _inspect_run_liveness(run_dir: pathlib.Path) -> dict[str, Any]:
     status_path = run_dir / "status.json"
-    status = _read_json(status_path) if status_path.exists() else {}
+    status: dict[str, Any] = {}
+    status_error = None
+    if status_path.exists():
+        try:
+            status = _read_json(status_path)
+        except Exception as exc:
+            status_error = f"{type(exc).__name__}: {exc}"
     terminal = {"completed", "failed", "canceled", "stopped"}
-    if status.get("status") in terminal:
-        return {"process_alive": False, "live_status": status.get("status")}
     locator_path = run_dir / "locator.json"
-    if not locator_path.exists():
-        return {"process_alive": False, "live_status": "unknown", "reason": "missing locator.json"}
-    locator = _read_json(locator_path)
-    process = _verified_process_from_locator(locator)
-    if process is None:
-        return {"process_alive": False, "live_status": "unknown", "reason": "worker process not verified"}
-    return {"process_alive": True, "live_status": status.get("status", "running"), "pid": process.pid}
+    if locator_path.exists():
+        try:
+            locator = _read_json(locator_path)
+        except Exception as exc:
+            payload = {"process_alive": False, "live_status": "unknown", "reason": f"invalid locator.json: {exc}"}
+            if status_error is not None:
+                payload["status_error"] = status_error
+            return payload
+        process = _verified_process_from_locator(locator)
+        if process is not None:
+            payload = {"process_alive": True, "live_status": status.get("status", "running"), "pid": process.pid}
+            if status.get("status") in terminal:
+                payload["terminal_status_with_live_process"] = True
+            if status_error is not None:
+                payload["status_error"] = status_error
+            return payload
+    elif status.get("status") not in terminal:
+        payload = {"process_alive": False, "live_status": "unknown", "reason": "missing locator.json"}
+        if status_error is not None:
+            payload["status_error"] = status_error
+        return payload
+
+    if status.get("status") in terminal:
+        payload = {"process_alive": False, "live_status": status.get("status")}
+        if status_error is not None:
+            payload["status_error"] = status_error
+        return payload
+
+    payload = {"process_alive": False, "live_status": "unknown", "reason": "worker process not verified"}
+    if status_error is not None:
+        payload["status_error"] = status_error
+    return payload
 
 
 def _read_events(run_dir: pathlib.Path, offset: Any, max_events: Any) -> dict[str, Any]:
@@ -1366,22 +1483,25 @@ def _read_events(run_dir: pathlib.Path, offset: Any, max_events: Any) -> dict[st
     events_path = run_dir / "events.jsonl"
     events: list[dict[str, Any]] = []
     line_count = 0
+    events_truncated = False
     if events_path.exists():
         with events_path.open("r", encoding="utf-8") as handle:
             for line_count, line in enumerate(handle, start=1):
                 if line_count <= offset:
                     continue
-                if len(events) >= max_events:
-                    continue
                 try:
                     events.append(json.loads(line))
                 except json.JSONDecodeError:
                     events.append({"event": "invalid_event_line", "line": line_count})
+                if len(events) >= max_events:
+                    events_truncated = next(handle, None) is not None
+                    break
     return {
         "events": events,
         "event_offset": offset,
         "next_event_offset": min(offset + len(events), line_count),
         "events_path": str(events_path),
+        "events_truncated": events_truncated,
     }
 
 
@@ -1393,14 +1513,33 @@ def _write_control(run_dir: pathlib.Path, action: str) -> pathlib.Path:
     return control_path
 
 
-def _terminate_verified_process_tree(run_dir: pathlib.Path) -> bool:
+def _terminate_verified_process_tree(run_dir: pathlib.Path) -> dict[str, Any]:
     locator_path = run_dir / "locator.json"
     if not locator_path.exists():
-        return False
-    process = _verified_process_from_locator(_read_json(locator_path))
+        return {"all_gone": True, "terminated": False, "termination_failed": False, "reason": "missing locator.json"}
+    try:
+        locator = _read_json(locator_path)
+    except Exception as exc:
+        return {
+            "all_gone": False,
+            "terminated": False,
+            "termination_failed": True,
+            "alive_pids": [],
+            "reason": f"could not read locator.json: {exc}",
+        }
+    process = _verified_process_from_locator(locator)
     if process is None:
-        return False
-    children = process.children(recursive=True)
+        return {"all_gone": True, "terminated": False, "termination_failed": False, "reason": "worker process not verified"}
+    try:
+        children = process.children(recursive=True)
+    except psutil.Error as exc:
+        return {
+            "all_gone": False,
+            "terminated": False,
+            "termination_failed": True,
+            "alive_pids": [process.pid],
+            "reason": f"could not inspect process tree: {exc}",
+        }
     for child in children:
         try:
             child.terminate()
@@ -1416,7 +1555,14 @@ def _terminate_verified_process_tree(run_dir: pathlib.Path) -> bool:
             proc.kill()
         except psutil.Error:
             pass
-    return True
+    _, still_alive = psutil.wait_procs(alive, timeout=5)
+    alive_pids = [proc.pid for proc in still_alive if proc.is_running()]
+    return {
+        "all_gone": not alive_pids,
+        "terminated": bool(gone or alive) and not alive_pids,
+        "termination_failed": bool(alive_pids),
+        "alive_pids": alive_pids,
+    }
 
 
 def _manage_gemini_run(args: dict[str, Any]) -> dict[str, Any]:
@@ -1427,7 +1573,15 @@ def _manage_gemini_run(args: dict[str, Any]) -> dict[str, Any]:
         for status_path in sorted(run_root.glob("run-*/status.json"), reverse=True):
             try:
                 status = _read_json(status_path)
-            except Exception:
+            except Exception as exc:
+                runs.append(
+                    {
+                        "run_id": status_path.parent.name,
+                        "run_dir": str(status_path.parent),
+                        "status": "corrupt",
+                        "error": f"Could not read status.json: {type(exc).__name__}: {exc}",
+                    }
+                )
                 continue
             runs.append(
                 {
@@ -1460,22 +1614,40 @@ def _manage_gemini_run(args: dict[str, Any]) -> dict[str, Any]:
     if action in {"stop", "cancel"}:
         control_path = _write_control(run_dir, action)
         force = args.get("force", False)
-        terminated = False
+        termination = {
+            "all_gone": False,
+            "terminated": False,
+            "termination_failed": False,
+            "alive_pids": [],
+        }
         if action == "cancel" and force is True:
-            terminated = _terminate_verified_process_tree(run_dir)
-            try:
-                status = _read_json(run_dir / "status.json")
-                status["status"] = "canceled"
-                _write_status(run_dir, status)
-            except Exception:
-                pass
-            _append_event(run_dir, {"run_id": run_dir.name, "event": "run_canceled", "forced": True})
+            termination = _terminate_verified_process_tree(run_dir)
+            if termination["all_gone"]:
+                try:
+                    status = _read_json(run_dir / "status.json")
+                    status["status"] = "canceled"
+                    _write_status(run_dir, status)
+                except Exception:
+                    pass
+                _append_event(run_dir, {"run_id": run_dir.name, "event": "run_canceled", "forced": True})
+            else:
+                _append_event(
+                    run_dir,
+                    {
+                        "run_id": run_dir.name,
+                        "event": "cancel_failed",
+                        "forced": True,
+                        "alive_pids": termination.get("alive_pids", []),
+                    },
+                )
         return {
             "run_id": run_dir.name,
             "run_dir": str(run_dir),
             "action": action,
             "control_path": str(control_path),
-            "forced_termination": terminated,
+            "forced_termination": termination["terminated"],
+            "termination_failed": termination["termination_failed"],
+            "alive_pids": termination.get("alive_pids", []),
             "liveness": _inspect_run_liveness(run_dir),
         }
 
@@ -1483,6 +1655,9 @@ def _manage_gemini_run(args: dict[str, Any]) -> dict[str, Any]:
         plan_path = run_dir / "plan.json"
         if not plan_path.exists():
             raise ValueError(f"Missing plan.json for run: {run_dir}")
+        liveness = _inspect_run_liveness(run_dir)
+        if liveness.get("process_alive") is True:
+            raise ValueError(f"Cannot resume run while a verified worker is still alive: {run_dir}")
         plan = _read_json(plan_path)
         for control_name in ("stop.json", "cancel.json"):
             control_path = run_dir / "control" / control_name
@@ -1649,8 +1824,13 @@ async def run_worker_from_dir(run_dir: str, run_id: str, run_token: str) -> None
     plan = _read_json(run_path / "plan.json")
     if plan.get("run_id") != run_id:
         raise ValueError(f"run_id mismatch for worker: {run_id}")
+    deadline = time.monotonic() + 10
+    while not _locator_matches_worker(run_path, run_id, run_token):
+        if time.monotonic() >= deadline:
+            raise ValueError(f"locator.json does not match worker identity for run: {run_id}")
+        await anyio.sleep(0.05)
     _append_event(run_path, {"run_id": run_id, "event": "worker_started"})
-    await _execute_run_plan(plan, run_dir=run_path, background=True)
+    await _execute_run_plan(plan, run_dir=run_path, background=True, worker_token=run_token)
 
 
 async def main() -> None:
