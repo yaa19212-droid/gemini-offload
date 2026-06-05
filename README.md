@@ -148,45 +148,109 @@ Notes:
 - The server sends local files as inline Vertex parts and does not use the Gemini Files API.
 - Set `GEMINI_OFFLOAD_OUTPUT_DIR` to an absolute path if you want automatic
   large-response spill files outside the OS temp directory.
+- Set `GEMINI_OFFLOAD_RUN_DIR` to an absolute path if you want background run
+  directories outside the OS temp directory.
 - After updating `config.toml`, restart Codex or open a new session so the MCP server list is reloaded.
 
 ## Tools
 
-### `gemini_generate`
+### `call_gemini`
 
-Upload local absolute-path files and run `generate_content`.
+Run one or more Gemini request items. This is a breaking replacement for the
+old `gemini_generate` and `gemini_generate_batch` tools.
 
-| param | type | notes |
-|---|---|---|
-| `prompt` | string | required |
-| `files` | string[] | optional, absolute paths |
-| `system_prompt` | string | optional |
-| `model` | string | default `gemini-3.1-pro-preview` |
-| `include_thinking` | bool | default `false` |
-| `google_search` | bool | default `false`; enables Google Search grounding |
-| `response_json_schema` | object | optional JSON Schema object for structured JSON output |
-| `response_json_schema_path` | string | optional absolute path to a JSON Schema file |
-| `history` | `[{role, text}]` | optional few-shot turns |
-| `output_path` | string | **recommended**, absolute path |
-| `rate_limit_mode` | string | `fail_fast` default, or `wait` |
-| `fallback_models` | string[] | optional explicit fallback list |
-| `rate_limit_max_wait_seconds` | number | wait-mode cap, default `120` |
+Two input shapes are supported:
+
+- explicit: each item provides a complete request envelope
+- template: `template_path` contains one request envelope and each item provides
+  placeholder vars
+
+Request envelopes use ordered Gemini-style `contents[]`:
+
+```json
+{
+  "items": [
+    {
+      "id": "chunk-01",
+      "request": {
+        "model": "gemini-3.1-pro-preview",
+        "system": {"path": "D:/work/prompts/ocr.md"},
+        "contents": [
+          {"role": "user", "parts": [
+            {"file_path": "D:/work/in/chunk-01.pdf"},
+            {"text": "OCR this chunk to markdown."}
+          ]}
+        ],
+        "output": {"mode": "text", "path": "D:/work/out/chunk-01.md"},
+        "tools": {"google_search": false}
+      }
+    }
+  ],
+  "execution": {"lifecycle": "blocking", "max_concurrency": 1}
+}
+```
+
+Background template run:
+
+```json
+{
+  "template_path": "D:/work/templates/ocr-request.json",
+  "items": [
+    {"id": "chunk-01", "vars": {"chunk_path": "D:/work/in/chunk-01.pdf", "page": 1}},
+    {"id": "chunk-02", "vars": {"chunk_path": "D:/work/in/chunk-02.pdf", "page": 2}}
+  ],
+  "execution": {"lifecycle": "background", "max_concurrency": 4}
+}
+```
+
+| field | notes |
+|---|---|
+| `system.text` / `system.path` | optional system instruction, exactly one when present |
+| `contents[].parts[].text` | inline text part |
+| `contents[].parts[].text_path` | absolute path to UTF-8 text |
+| `contents[].parts[].file_path` | absolute path to supported local file |
+| `output.mode` | `text` default, or `json_schema` |
+| `output.path` | explicit result path; background auto-generates one if omitted |
+| `output.json_schema` / `output.json_schema_path` | required exactly one for `json_schema` mode |
+| `tools.google_search` | default `false`; enables Google Search grounding |
+| `rate_limit.mode` | `fail_fast` default, or `wait` |
+| `rate_limit.fallback_models` | optional explicit fallback list |
+| `rate_limit.max_wait_seconds` | wait-mode cap, default `120` |
 
 **Output policy:**
 - Short responses up to 4096 UTF-8 bytes return full inline `text`.
-- Providing `output_path` forces file output even for short responses.
+- Providing `output.path` forces file output even for short responses.
 - Larger responses are written to `output_path` when provided, or to
   `GEMINI_OFFLOAD_OUTPUT_DIR` / OS temp when omitted. The inline response
   returns `text_preview`, `output_path`, `byte_count`, `line_count`, and
   `read_guidance`.
-- With `response_json_schema` or `response_json_schema_path`, short valid JSON
+- With `output.json_schema` or `output.json_schema_path`, short valid JSON
   returns parsed `response_json`. Larger JSON returns `response_json_preview`
   plus `output_path`.
-- With `google_search: true`: response may include normalized `grounding`
+- With `tools.google_search: true`: response may include normalized `grounding`
   metadata with `queries`, `sources`, and `supports`. Google Search UI payloads
   such as `renderedContent` and `sdkBlob` are intentionally omitted.
+- `execution.lifecycle: "background"` starts a child worker process and returns
+  run paths immediately instead of final result bodies.
 - `structuredContent` is the authoritative result. `content[0].text` is only a
   short receipt or read guide, not a serialized copy of `structuredContent`.
+
+### `manage_gemini_run`
+
+Inspect or control background runs.
+
+```json
+{
+  "action": "status",
+  "run_id": "run-20260605T010203000000Z-abcd1234"
+}
+```
+
+Actions: `list`, `status`, `progress`, `stop`, `cancel`, `resume`.
+
+Background run directories contain `plan.json`, `status.json`, `events.jsonl`,
+`locator.json`, `control/`, and `outputs/`. The event log is append-only
+debug/audit data; live state is checked from the worker process where possible.
 
 ### `list_gemini_models`
 
@@ -212,46 +276,10 @@ PDF, plain text / markdown / CSV, PNG/JPEG/GIF/BMP/WEBP, MP3/WAV/FLAC/OGG/M4A.
 
 ## Orchestration pattern
 
-The orchestrator agent splits a big job into N independent subtasks, picks
-distinct `output_path` values for each, and calls `gemini_generate_batch`.
-The batch tool runs jobs concurrently, defaults concurrency to the configured
-Vertex credential count, and caps it at 32. Rate limits are tracked per
-Vertex project/location/model quota slot. If a slot returns 429, the default
-`fail_fast` mode returns a structured rate-limit result with retry and
-fallback guidance; callers may opt into `rate_limit_mode: "wait"` or provide
-explicit `fallback_models`.
+The orchestrator agent samples large sources, writes reusable prompt/template
+files, then calls `call_gemini` with either one item or many items. Multi-item
+runs preserve input order and run concurrently up to `max_concurrency`.
 
-Batch calls remain synchronous at the tool boundary, but jobs run concurrently
-up to `max_concurrency`. If the final batch response would exceed 4096 UTF-8
-bytes, successful job outputs are saved to files and the inline response keeps
-receipts, previews, paths, and `read_guidance`. If even the compacted results
-are too large, the compacted manifest is saved to `results_path`.
-
-### `gemini_generate_batch`
-
-Run multiple independent `gemini_generate`-shaped jobs concurrently.
-
-```json
-{
-  "max_concurrency": 4,
-  "jobs": [
-    {
-      "id": "chunk-01",
-      "prompt": "OCR this file to markdown.",
-      "files": ["D:/work/in/chunk-01.pdf"],
-      "output_path": "D:/work/out/chunk-01.md"
-    },
-    {
-      "id": "chunk-02",
-      "prompt": "OCR this file to markdown.",
-      "files": ["D:/work/in/chunk-02.pdf"],
-      "output_path": "D:/work/out/chunk-02.md"
-    }
-  ]
-}
-```
-
-The result preserves input order and returns per-job `ok`, preview, usage,
-timing, output path, and error fields. Large batches may return
-`results_compacted`; follow `read_guidance` and read only targeted
-`output_path` files or `results_path` sections.
+Use blocking lifecycle for small or immediate tasks. Use background lifecycle
+for long OCR/transcription runs; then poll with `manage_gemini_run` or inspect
+only targeted output files/events.

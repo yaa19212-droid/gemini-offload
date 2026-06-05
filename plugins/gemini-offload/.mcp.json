@@ -12,7 +12,7 @@
       "env": {
         "GOOGLE_CLOUD_LOCATION": "global"
       },
-      "note": "Repo-local stdio MCP wrapper. Set GEMINI_OFFLOAD_REPO and GEMINI_OFFLOAD_VERTEX_CREDENTIALS, optionally GEMINI_OFFLOAD_OUTPUT_DIR, or configure them under mcp_servers.gemini-offload.env."
+      "note": "Repo-local stdio MCP wrapper. Set GEMINI_OFFLOAD_REPO and GEMINI_OFFLOAD_VERTEX_CREDENTIALS, optionally GEMINI_OFFLOAD_OUTPUT_DIR and GEMINI_OFFLOAD_RUN_DIR, or configure them under mcp_servers.gemini-offload.env."
     }
   }
 }

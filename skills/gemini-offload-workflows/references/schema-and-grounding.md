@@ -27,10 +27,10 @@ when the target fields are known; it can hurt when the source is unusual.
 
 ## JSON Schema Inputs
 
-Two inputs are supported:
+Two request envelope fields are supported:
 
-- `response_json_schema`: inline JSON Schema object
-- `response_json_schema_path`: absolute path to a JSON Schema file
+- `output.json_schema`: inline JSON Schema object
+- `output.json_schema_path`: absolute path to a JSON Schema file
 
 They are mutually exclusive. Prefer the path form when the schema is reused,
 large, or easier to validate separately.
@@ -56,9 +56,9 @@ For plain text results, use `structuredContent.text` when inline or
 
 ## Google Search Grounding
 
-Set `google_search: true` only when current or web-grounded information is part
-of the task. The server asks Gemini to use Google Search and normalizes returned
-grounding data for agent consumption.
+Set `tools.google_search: true` only when current or web-grounded information is
+part of the task. The server asks Gemini to use Google Search and normalizes
+returned grounding data for agent consumption.
 
 The normalized grounding shape favors:
 

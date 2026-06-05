@@ -1,7 +1,7 @@
 {
   "name": "gemini-offload",
   "version": "0.1.0",
-  "description": "Codex plugin that bundles the gemini-offload MCP server and workflow skill for bounded plain-text or structured Gemini subtasks.",
+  "description": "Codex plugin that bundles the run-oriented gemini-offload MCP server and workflow skill for bounded plain-text or structured Gemini subtasks.",
   "author": {
     "name": "yaa19212-droid",
     "url": "https://github.com/yaa19212-droid"
@@ -22,7 +22,7 @@
   "interface": {
     "displayName": "Gemini Offload",
     "shortDescription": "Bounded Gemini workflows with a local MCP server",
-    "longDescription": "Use the gemini-offload MCP server plus bundled workflow guidance to offload OCR, transcription, flexible plain-text multimodal analysis, optional structured JSON extraction, Google Search grounded answers, cleanup, and other bounded Gemini subtasks without bloating the main Codex context. Plain text is the default mode; JSON schema is available when strict machine-readable fields are worth the reduced flexibility. Results are returned through structuredContent receipts with path-backed output policies for large or explicitly saved artifacts.",
+    "longDescription": "Use the run-oriented gemini-offload MCP server plus bundled workflow guidance to offload OCR, transcription, flexible plain-text multimodal analysis, optional structured JSON extraction, Google Search grounded answers, cleanup, background runs, and concurrent Gemini item processing without bloating the main Codex context. Plain text is the default mode; JSON schema is available when strict machine-readable fields are worth the reduced flexibility. Results are returned through structuredContent receipts with path-backed output and background run management policies.",
     "developerName": "yaa19212-droid",
     "category": "Coding",
     "capabilities": [
@@ -33,9 +33,9 @@
     "privacyPolicyURL": "https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement",
     "termsOfServiceURL": "https://docs.github.com/en/site-policy/github-terms/github-terms-of-service",
     "defaultPrompt": [
-      "Use Gemini Offload to OCR one chunk into markdown with output_path",
-      "Use Gemini Offload to transcribe one audio chunk into clean Korean text",
-      "Use Gemini Offload for plain-text OCR, adding schema only if needed"
+      "Use call_gemini to OCR one chunk into markdown",
+      "Start a background Gemini OCR run",
+      "Use call_gemini with JSON schema extraction"
     ],
     "brandColor": "#1A73E8",
     "composerIcon": "./assets/gemini-offload.svg",

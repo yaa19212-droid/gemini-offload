@@ -9,10 +9,10 @@ machine-specific paths.
 ## Core Principles
 
 - Keep preprocessing and OCR as separate steps. Review the preprocessed page
-  images before launching a large OCR batch.
+  images before launching a large OCR run.
 - Preserve meaningful figures, screenshots, charts, and diagrams as
   `[[IMG:...]]` placeholders when they should remain linked to the text output.
-- Run Gemini OCR in chunks. Each chunk should have its own `output_path`.
+- Run Gemini OCR in chunks. Each chunk should have its own `output.path`.
 - Treat the final manifest as the source of truth for validation.
 
 ## Standard Directory Layout
@@ -58,7 +58,7 @@ Typical helper scripts:
 - `publish_candidate_images.py`: copy selected figure candidates into
   `output/img/`.
 - `render_placeholders.py`: insert or verify `[[IMG:...]]` placeholders.
-- `create_ocr_jobs.py`: split OCR pages into batch job manifests.
+- `create_ocr_jobs.py`: split OCR pages into run item manifests.
 - `extract_pdf_text_baseline.py`: extract a text-layer baseline when available.
 - `validate_placeholder_outputs.py`: verify page sections and placeholders.
 
@@ -67,7 +67,7 @@ Typical helper scripts:
 ### 1. Intake
 
 Place source PDFs under `<artifact-root>/raw-pdf/`. Prefer ASCII filenames for
-batch scripts, but the workflow can support Korean filenames when paths are
+batch scripts, but the workflow can support non-ASCII filenames when paths are
 handled with literal-path APIs.
 
 ```powershell
@@ -87,28 +87,31 @@ The review gate should answer:
 - Are important figures preserved?
 - Does each OCR page correspond to the expected source page?
 
-### 3. Create OCR Jobs
+### 3. Create OCR Run Items
 
-Create a manifest where each job has:
+Create a manifest where each item has:
 
 - a stable `id`
-- one or more page image paths
-- a clear prompt
-- an absolute `output_path`
+- one or more page image or PDF chunk paths
+- a clear prompt in `contents[].parts[]`
+- an absolute `output.path`
 
 Small example:
 
 ```json
 {
-  "max_concurrency": 4,
-  "jobs": [
+  "execution": {"lifecycle": "background", "max_concurrency": 4},
+  "items": [
     {
       "id": "chunk-001",
-      "prompt": "OCR this chunk to clean markdown. Preserve headings, lists, tables, and uncertain text markers.",
-      "files": ["D:/work/pdf-ocr/example-document/ocr-pages/page-001.png"],
-      "system_prompt_path": "D:/work/gemini-offload/prompts/ocr_system.md",
-      "history_path": "D:/work/gemini-offload/prompts/ocr_fewshot.json",
-      "output_path": "D:/work/pdf-ocr/example-document/output/text/chunk-001.md"
+      "request": {
+        "system": {"path": "D:/work/gemini-offload/prompts/ocr_system.md"},
+        "contents": [{"role": "user", "parts": [
+          {"file_path": "D:/work/pdf-ocr/example-document/ocr-pages/page-001.png"},
+          {"text": "OCR this chunk to clean markdown. Preserve headings, lists, tables, and uncertain text markers."}
+        ]}],
+        "output": {"mode": "text", "path": "D:/work/pdf-ocr/example-document/output/text/chunk-001.md"}
+      }
     }
   ]
 }

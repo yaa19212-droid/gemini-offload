@@ -1,60 +1,52 @@
-# Batch Workflows
+# Multi-Item And Background Runs
 
-Use `gemini_generate_batch` for many independent jobs that can run concurrently,
-such as page-range OCR, audio chunk transcription, plain-text cleanup, or
-repeated structured extraction.
+Use `call_gemini` with multiple items when independent artifacts can run
+concurrently, such as page OCR, audio chunk transcription, cleanup passes, or
+repeated extraction.
 
 ## Execution Model
 
-- The MCP tool call is synchronous: it returns after all jobs finish.
-- Jobs run concurrently up to `max_concurrency`.
-- The server uses a semaphore and task group internally; the aggregate budget is
-  evaluated only after all jobs have completed.
-- Rate limits are tracked per Vertex project/location/model quota slot.
+- A run always has one or more items.
+- `execution.lifecycle: "blocking"` waits for all items.
+- `execution.lifecycle: "background"` starts a child worker and returns paths.
+- Items run concurrently up to `execution.max_concurrency`.
+- The old `gemini_generate_batch` tool is intentionally replaced.
 
-Do not use batch for jobs that depend on each other's outputs.
+## Template Runs
 
-## Aggregate Budget
+Prefer template input for repeated work. The template is a request envelope with
+`{{placeholder}}` strings; each item supplies vars.
 
-The batch response has a 4096-byte aggregate budget over final
+Use this for OCR/chunk runs so repeated system prompts, content structure, and
+output path rules live in one file.
+
+Placeholder names are run-local and conservative. Missing vars, unused vars,
+relative paths after substitution, or invalid placeholder names are rejected.
+
+## Blocking Aggregate Budget
+
+Blocking multi-item runs have a 4096-byte aggregate budget over final
 `structuredContent`.
 
-If the initial response is too large:
+If the response is too large:
 
-- successful inline `text` and `response_json` results are written to per-job
-  files
-- already file-backed successful jobs are reused and not written again
-- error jobs remain inline when possible for diagnosis
-- `results_compacted`, `aggregate_byte_count`, `aggregate_inline_limit`, and
-  `read_guidance` explain what happened
+- successful inline `text` and `response_json` results are written to files
+- already file-backed successful items are reused
+- error items remain inline when possible
+- compacted results may move to `results_path`
 
-If compacted results are still too large:
+Follow `read_guidance` and inspect targeted item outputs instead of loading the
+whole result set.
 
-- full compacted results are written to `results_path`
-- inline `results` becomes an empty array
-- `results_omitted` and `omitted_result_count` tell the agent not to expect
-  inline job details
+## Background Reading Pattern
 
-## Recommended OCR Or Extraction Loop
+For long runs:
 
-1. Build a manifest of chunks in the orchestrator.
-2. Give every job a stable `id` and unique `output_path`.
-3. Use shared `system_prompt_path`, `history_path`, or
-   `response_json_schema_path` when that mode fits the task.
-4. Set `max_concurrency` to the desired parallelism.
-5. After the batch returns, inspect summary counts first.
-6. Open only failed jobs, suspicious previews, or sampled successful outputs.
-7. Assemble final output locally from the saved artifacts.
+1. Start `call_gemini` with background lifecycle.
+2. Save `run_id`, `run_dir`, `status_path`, and `events_path`.
+3. Use `manage_gemini_run` with `status` or `progress`.
+4. Read only newly appended events by offset.
+5. Inspect failed items or sampled successful output files.
+6. Assemble final artifacts locally from saved output paths.
 
-## Reading Results Safely
-
-Prefer targeted reads:
-
-- inspect the top-level summary
-- inspect failed job entries
-- read one or two sampled output files
-- read `results_path` only by targeted ranges or JSON filtering when possible
-
-Avoid loading every saved output or the full manifest into the main context.
-For OCR and irregular multimodal sources, prefer plain text or markdown output
-unless a downstream automated merge needs strict fields.
+Avoid loading every saved output or the full event log into the main context.

@@ -611,6 +611,69 @@ def _build_contents(
     return contents
 
 
+def _load_text_path_part(text_path: str) -> types.Part:
+    path_obj = sanitize_path(text_path)
+    if not path_obj.exists():
+        raise FileNotFoundError(f"Missing text_path: {text_path}")
+    if not path_obj.is_file():
+        raise ValueError(f"text_path is not a file: {text_path}")
+    return types.Part.from_text(text=path_obj.read_text(encoding="utf-8"))
+
+
+def _build_contents_from_spec(contents_spec: list[dict[str, Any]]) -> list[types.Content]:
+    if not isinstance(contents_spec, list) or not contents_spec:
+        raise ValueError("contents must be a non-empty array.")
+
+    contents: list[types.Content] = []
+    for content_index, content_spec in enumerate(contents_spec, start=1):
+        if not isinstance(content_spec, dict):
+            raise ValueError(f"contents[{content_index}] must be an object.")
+
+        role = content_spec.get("role")
+        if not isinstance(role, str) or role.strip().lower() not in {"user", "model"}:
+            raise ValueError(f"contents[{content_index}].role must be one of: user, model.")
+        normalized_role = role.strip().lower()
+
+        raw_parts = content_spec.get("parts")
+        if not isinstance(raw_parts, list) or not raw_parts:
+            raise ValueError(f"contents[{content_index}].parts must be a non-empty array.")
+
+        parts: list[types.Part] = []
+        for part_index, part_spec in enumerate(raw_parts, start=1):
+            if not isinstance(part_spec, dict):
+                raise ValueError(f"contents[{content_index}].parts[{part_index}] must be an object.")
+
+            part_fields = [name for name in ("text", "text_path", "file_path") if name in part_spec]
+            if len(part_fields) != 1:
+                raise ValueError(
+                    f"contents[{content_index}].parts[{part_index}] must contain exactly one of "
+                    "text, text_path, or file_path."
+                )
+
+            field_name = part_fields[0]
+            field_value = part_spec[field_name]
+            if field_name == "text":
+                if not isinstance(field_value, str):
+                    raise ValueError(f"contents[{content_index}].parts[{part_index}].text must be a string.")
+                parts.append(types.Part.from_text(text=field_value))
+            elif field_name == "text_path":
+                if not isinstance(field_value, str) or not field_value.strip():
+                    raise ValueError(
+                        f"contents[{content_index}].parts[{part_index}].text_path must be a non-empty string."
+                    )
+                parts.append(_load_text_path_part(field_value))
+            else:
+                if not isinstance(field_value, str) or not field_value.strip():
+                    raise ValueError(
+                        f"contents[{content_index}].parts[{part_index}].file_path must be a non-empty string."
+                    )
+                parts.append(_load_file_part(field_value))
+
+        contents.append(types.Content(role=normalized_role, parts=parts))
+
+    return contents
+
+
 def _generate_with_lease(
     prompt: str,
     requested_files: list[str],
@@ -635,6 +698,51 @@ def _generate_with_lease(
         for file_path in requested_files
     ]
     contents = _build_contents(prompt=prompt, file_parts=file_parts, history=normalized_history)
+    response = _call_with_retry(
+        lambda: _call_api(
+            client=client,
+            model_name=model,
+            contents_list=contents,
+            system_prompt=effective_system_prompt,
+            include_thinking=include_thinking,
+            google_search=google_search,
+            response_json_schema=response_json_schema,
+        )
+    )
+    payload = _extract_response_payload(response)
+    grounding = _normalize_grounding_metadata(response)
+
+    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    result = {
+        "text": payload["text"],
+        "images": payload["images"],
+        "model": _extract_response_model(response, model),
+        "usage": _extract_usage(response),
+        "elapsed_ms": elapsed_ms,
+    }
+    if grounding:
+        result["grounding"] = grounding
+    return result
+
+
+def _generate_request_with_lease(
+    contents_spec: list[dict[str, Any]],
+    effective_system_prompt: str,
+    model: str,
+    include_thinking: bool,
+    google_search: bool,
+    response_json_schema: dict[str, Any] | None,
+    lease: ApiKeyLease,
+) -> dict[str, Any]:
+    client = genai.Client(
+        vertexai=True,
+        credentials=lease.credentials,
+        project=lease.project_id,
+        location=lease.location,
+    )
+    started_at = time.perf_counter()
+
+    contents = _call_with_retry(lambda: _build_contents_from_spec(contents_spec))
     response = _call_with_retry(
         lambda: _call_api(
             client=client,
@@ -732,6 +840,88 @@ def generate(
                             google_search=google_search,
                             response_json_schema=response_json_schema,
                             normalized_history=normalized_history,
+                            lease=acquired.lease,
+                        )
+                    except Exception as exc:
+                        if not _is_rate_limit_error(exc):
+                            raise
+                        acquired.mark_cooldown(_retry_after_seconds(exc))
+                        last_rate_limit = GeminiRateLimitError(
+                            model=active_model,
+                            attempted_models=list(attempted_models),
+                            retry_after_seconds=_retry_after_seconds(exc),
+                            quota_slots=[acquired.quota_slot],
+                        )
+            except NoAvailableQuotaSlotError as exc:
+                last_rate_limit = GeminiRateLimitError(
+                    model=active_model,
+                    attempted_models=list(attempted_models),
+                    retry_after_seconds=exc.retry_after_seconds,
+                    quota_slots=exc.quota_slots,
+                )
+                break
+
+        if last_rate_limit is None:
+            continue
+
+    raise last_rate_limit or RuntimeError("Gemini request failed without raising an exception.")
+
+
+def generate_request(
+    contents: list[dict[str, Any]],
+    system_prompt: str | None = None,
+    model: str = DEFAULT_MODEL_NAME,
+    include_thinking: bool = False,
+    rate_limit_mode: str = RATE_LIMIT_MODE_FAIL_FAST,
+    fallback_models: list[str] | None = None,
+    rate_limit_max_wait_seconds: float | int | None = None,
+    google_search: bool = False,
+    response_json_schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Execute a Gemini request from an ordered contents envelope."""
+
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("model must be a non-empty string.")
+    primary_model = model.strip()
+    model_sequence = _normalize_model_sequence(primary_model, fallback_models)
+    normalized_rate_limit_mode = _normalize_rate_limit_mode(rate_limit_mode)
+    max_wait_seconds = _normalize_rate_limit_max_wait_seconds(rate_limit_max_wait_seconds)
+    if not isinstance(include_thinking, bool):
+        raise ValueError("include_thinking must be a boolean.")
+    if not isinstance(google_search, bool):
+        raise ValueError("google_search must be a boolean.")
+    if response_json_schema is not None and not isinstance(response_json_schema, dict):
+        raise ValueError("response_json_schema must be a JSON object.")
+
+    effective_system_prompt = (
+        system_prompt.strip()
+        if isinstance(system_prompt, str) and system_prompt.strip()
+        else DEFAULT_SYSTEM_PROMPT
+    )
+
+    attempted_models: list[str] = []
+    last_rate_limit: GeminiRateLimitError | None = None
+    max_key_attempts = max(1, get_key_count())
+    wait_for_cooldown = normalized_rate_limit_mode == RATE_LIMIT_MODE_WAIT
+    attempts_per_model = max_key_attempts * (2 if wait_for_cooldown else 1)
+
+    for active_model in model_sequence:
+        attempted_models.append(active_model)
+        for _ in range(attempts_per_model):
+            try:
+                with acquire_vertex_credential_lease(
+                    model=active_model,
+                    wait_for_cooldown=wait_for_cooldown,
+                    max_wait_seconds=max_wait_seconds,
+                ) as acquired:
+                    try:
+                        return _generate_request_with_lease(
+                            contents_spec=contents,
+                            effective_system_prompt=effective_system_prompt,
+                            model=active_model,
+                            include_thinking=include_thinking,
+                            google_search=google_search,
+                            response_json_schema=response_json_schema,
                             lease=acquired.lease,
                         )
                     except Exception as exc:
