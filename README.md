@@ -209,6 +209,9 @@ Background template run:
 | `contents[].parts[].text` | inline text part |
 | `contents[].parts[].text_path` | absolute path to UTF-8 text |
 | `contents[].parts[].file_path` | absolute path to supported local file |
+| `contents[].parts[].file_uri` / `.mime_type` | remote file URI plus required MIME type |
+| `request.media_resolution` | optional defaults for image/PDF/video; omit for `image=ultra_high`, `pdf=high`, `video=high` |
+| `contents[].parts[].media_resolution` | optional per-file override: `low`, `medium`, `high`, `ultra_high`, or `off` |
 | `output.mode` | `text` default, or `json_schema` |
 | `output.path` | explicit result path; background auto-generates one if omitted |
 | `output.json_schema` / `output.json_schema_path` | required exactly one for `json_schema` mode |
@@ -230,6 +233,10 @@ Background template run:
 - With `tools.google_search: true`: response may include normalized `grounding`
   metadata with `queries`, `sources`, and `supports`. Google Search UI payloads
   such as `renderedContent` and `sdkBlob` are intentionally omitted.
+- Media resolution is sent per file part, not globally. By default, images use
+  `ultra_high`, PDFs and videos use `high`, and audio receives no media
+  resolution option. Use `media_resolution: "off"` to omit it for a specific
+  image/PDF/video part. `ultra_high` is image-only.
 - `execution.lifecycle: "background"` starts a child worker process and returns
   run paths immediately instead of final result bodies.
 - `structuredContent` is the authoritative result. `content[0].text` is only a
@@ -272,7 +279,8 @@ Input: `{path: string}` (absolute). Returns `{mime, supported}`.
 
 ## Supported file types
 
-PDF, plain text / markdown / CSV, PNG/JPEG/GIF/BMP/WEBP, MP3/WAV/FLAC/OGG/M4A.
+PDF, plain text / markdown / CSV, PNG/JPEG/GIF/BMP/WEBP, common video files
+(MP4/MPEG/MOV/AVI/WEBM/WMV/FLV/3GP), MP3/WAV/FLAC/OGG/M4A.
 
 ## Orchestration pattern
 

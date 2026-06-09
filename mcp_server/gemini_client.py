@@ -27,6 +27,19 @@ RATE_LIMIT_MODE_FAIL_FAST = "fail_fast"
 RATE_LIMIT_MODE_WAIT = "wait"
 RATE_LIMIT_MODES = {RATE_LIMIT_MODE_FAIL_FAST, RATE_LIMIT_MODE_WAIT}
 DEFAULT_RATE_LIMIT_MAX_WAIT_SECONDS = 120.0
+MEDIA_RESOLUTION_INPUT_VALUES = ("low", "medium", "high", "ultra_high", "off")
+MEDIA_RESOLUTION_POLICY_KEYS = ("image", "pdf", "video")
+DEFAULT_MEDIA_RESOLUTION_POLICY = {
+    "image": "ultra_high",
+    "pdf": "high",
+    "video": "high",
+}
+MEDIA_RESOLUTION_API_LEVELS = {
+    "low": "MEDIA_RESOLUTION_LOW",
+    "medium": "MEDIA_RESOLUTION_MEDIUM",
+    "high": "MEDIA_RESOLUTION_HIGH",
+    "ultra_high": "MEDIA_RESOLUTION_ULTRA_HIGH",
+}
 
 
 @dataclass(frozen=True)
@@ -125,6 +138,15 @@ MIME_TYPE_MAP = {
     ".gif": "image/gif",
     ".bmp": "image/bmp",
     ".webp": "image/webp",
+    ".mp4": "video/mp4",
+    ".mpeg": "video/mpeg",
+    ".mpg": "video/mpeg",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+    ".webm": "video/webm",
+    ".wmv": "video/x-ms-wmv",
+    ".flv": "video/x-flv",
+    ".3gp": "video/3gpp",
     ".mp3": "audio/mpeg",
     ".wav": "audio/wav",
     ".flac": "audio/flac",
@@ -219,6 +241,78 @@ def _normalize_model_sequence(model: str, fallback_models: list[str] | None) -> 
             seen.add(normalized_model)
             sequence.append(normalized_model)
     return sequence
+
+
+def normalize_media_resolution_override(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be one of: {', '.join(MEDIA_RESOLUTION_INPUT_VALUES)}.")
+    normalized = value.strip().lower()
+    if normalized not in MEDIA_RESOLUTION_INPUT_VALUES:
+        raise ValueError(f"{field_name} must be one of: {', '.join(MEDIA_RESOLUTION_INPUT_VALUES)}.")
+    return normalized
+
+
+def _validate_media_resolution_policy_value(kind: str, value: str, field_name: str) -> None:
+    if kind != "image" and value == "ultra_high":
+        raise ValueError(f"{field_name}='ultra_high' is only supported for image media.")
+
+
+def normalize_media_resolution_policy(value: Any, field_name: str = "request.media_resolution") -> dict[str, str]:
+    policy = dict(DEFAULT_MEDIA_RESOLUTION_POLICY)
+    if value is None:
+        return policy
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be an object with image, pdf, or video keys.")
+
+    for key, raw_value in value.items():
+        if key not in MEDIA_RESOLUTION_POLICY_KEYS:
+            raise ValueError(f"{field_name} only supports keys: {', '.join(MEDIA_RESOLUTION_POLICY_KEYS)}.")
+        normalized_value = normalize_media_resolution_override(raw_value, f"{field_name}.{key}")
+        _validate_media_resolution_policy_value(key, normalized_value, f"{field_name}.{key}")
+        policy[key] = normalized_value
+    return policy
+
+
+def _media_resolution_kind(mime_type: str) -> str | None:
+    if mime_type.startswith("image/"):
+        return "image"
+    if mime_type == "application/pdf":
+        return "pdf"
+    if mime_type.startswith("video/"):
+        return "video"
+    if mime_type.startswith("audio/"):
+        return "audio"
+    return None
+
+
+def validate_media_resolution_for_mime(mime_type: str, value: Any, field_name: str) -> str:
+    normalized_value = normalize_media_resolution_override(value, field_name)
+    kind = _media_resolution_kind(mime_type)
+    if kind == "audio":
+        raise ValueError(f"{field_name} is not supported for audio parts.")
+    if kind is None:
+        raise ValueError(f"{field_name} is only supported for image, PDF, or video parts.")
+    _validate_media_resolution_policy_value(kind, normalized_value, field_name)
+    return normalized_value
+
+
+def _media_resolution_payload_for_mime(
+    mime_type: str,
+    policy: dict[str, str],
+    override: Any = None,
+    field_name: str = "media_resolution",
+) -> dict[str, str] | None:
+    if override is not None:
+        requested_resolution = validate_media_resolution_for_mime(mime_type, override, field_name)
+    else:
+        kind = _media_resolution_kind(mime_type)
+        if kind not in MEDIA_RESOLUTION_POLICY_KEYS:
+            return None
+        requested_resolution = policy[kind]
+
+    if requested_resolution == "off":
+        return None
+    return {"level": MEDIA_RESOLUTION_API_LEVELS[requested_resolution]}
 
 
 def detect_mime(path: str) -> dict[str, Any]:
@@ -459,7 +553,24 @@ def _extract_response_payload(response) -> dict[str, Any]:
     }
 
 
-def _load_file_part(file_path: str) -> types.Part:
+def _part_from_bytes(data: bytes, mime_type: str, media_resolution: dict[str, str] | None) -> types.Part:
+    if media_resolution is None:
+        return types.Part.from_bytes(data=data, mime_type=mime_type)
+    return types.Part.from_bytes(data=data, mime_type=mime_type, media_resolution=media_resolution)
+
+
+def _part_from_uri(file_uri: str, mime_type: str, media_resolution: dict[str, str] | None) -> types.Part:
+    if media_resolution is None:
+        return types.Part.from_uri(file_uri=file_uri, mime_type=mime_type)
+    return types.Part.from_uri(file_uri=file_uri, mime_type=mime_type, media_resolution=media_resolution)
+
+
+def _load_file_part(
+    file_path: str,
+    media_resolution_policy: dict[str, str] | None = None,
+    media_resolution: Any = None,
+    field_name: str = "file_path.media_resolution",
+) -> types.Part:
     """Load a local file as an inline part for Vertex AI Gemini."""
 
     path_obj = sanitize_path(file_path)
@@ -472,7 +583,48 @@ def _load_file_part(file_path: str) -> types.Part:
     if not is_supported_mime(detected_mime):
         raise ValueError(f"Unsupported MIME type for file '{file_path}': {detected_mime}")
 
-    return types.Part.from_bytes(data=path_obj.read_bytes(), mime_type=detected_mime)
+    policy = normalize_media_resolution_policy(media_resolution_policy)
+    resolution_payload = _media_resolution_payload_for_mime(
+        detected_mime,
+        policy,
+        media_resolution,
+        field_name,
+    )
+    return _part_from_bytes(
+        data=path_obj.read_bytes(),
+        mime_type=detected_mime,
+        media_resolution=resolution_payload,
+    )
+
+
+def _load_uri_part(
+    file_uri: str,
+    mime_type: str,
+    media_resolution_policy: dict[str, str] | None = None,
+    media_resolution: Any = None,
+    field_name: str = "file_uri.media_resolution",
+) -> types.Part:
+    if not isinstance(file_uri, str) or not file_uri.strip():
+        raise ValueError("file_uri must be a non-empty string.")
+    if not isinstance(mime_type, str) or not mime_type.strip():
+        raise ValueError("mime_type is required for file_uri parts.")
+
+    normalized_mime = mime_type.strip()
+    if not is_supported_mime(normalized_mime):
+        raise ValueError(f"Unsupported MIME type for file_uri '{file_uri}': {normalized_mime}")
+
+    policy = normalize_media_resolution_policy(media_resolution_policy)
+    resolution_payload = _media_resolution_payload_for_mime(
+        normalized_mime,
+        policy,
+        media_resolution,
+        field_name,
+    )
+    return _part_from_uri(
+        file_uri=file_uri.strip(),
+        mime_type=normalized_mime,
+        media_resolution=resolution_payload,
+    )
 
 
 def _call_api(
@@ -620,10 +772,14 @@ def _load_text_path_part(text_path: str) -> types.Part:
     return types.Part.from_text(text=path_obj.read_text(encoding="utf-8"))
 
 
-def _build_contents_from_spec(contents_spec: list[dict[str, Any]]) -> list[types.Content]:
+def _build_contents_from_spec(
+    contents_spec: list[dict[str, Any]],
+    media_resolution_policy: dict[str, str] | None = None,
+) -> list[types.Content]:
     if not isinstance(contents_spec, list) or not contents_spec:
         raise ValueError("contents must be a non-empty array.")
 
+    policy = normalize_media_resolution_policy(media_resolution_policy)
     contents: list[types.Content] = []
     for content_index, content_spec in enumerate(contents_spec, start=1):
         if not isinstance(content_spec, dict):
@@ -643,31 +799,66 @@ def _build_contents_from_spec(contents_spec: list[dict[str, Any]]) -> list[types
             if not isinstance(part_spec, dict):
                 raise ValueError(f"contents[{content_index}].parts[{part_index}] must be an object.")
 
-            part_fields = [name for name in ("text", "text_path", "file_path") if name in part_spec]
+            part_fields = [name for name in ("text", "text_path", "file_path", "file_uri") if name in part_spec]
             if len(part_fields) != 1:
                 raise ValueError(
                     f"contents[{content_index}].parts[{part_index}] must contain exactly one of "
-                    "text, text_path, or file_path."
+                    "text, text_path, file_path, or file_uri."
                 )
 
             field_name = part_fields[0]
             field_value = part_spec[field_name]
+            media_resolution_field = f"contents[{content_index}].parts[{part_index}].media_resolution"
+            has_media_resolution = "media_resolution" in part_spec
+            media_resolution = (
+                normalize_media_resolution_override(part_spec["media_resolution"], media_resolution_field)
+                if has_media_resolution
+                else None
+            )
             if field_name == "text":
+                if has_media_resolution:
+                    raise ValueError(f"contents[{content_index}].parts[{part_index}].media_resolution is not valid for text parts.")
                 if not isinstance(field_value, str):
                     raise ValueError(f"contents[{content_index}].parts[{part_index}].text must be a string.")
                 parts.append(types.Part.from_text(text=field_value))
             elif field_name == "text_path":
+                if has_media_resolution:
+                    raise ValueError(f"contents[{content_index}].parts[{part_index}].media_resolution is not valid for text_path parts.")
                 if not isinstance(field_value, str) or not field_value.strip():
                     raise ValueError(
                         f"contents[{content_index}].parts[{part_index}].text_path must be a non-empty string."
                     )
                 parts.append(_load_text_path_part(field_value))
-            else:
+            elif field_name == "file_path":
                 if not isinstance(field_value, str) or not field_value.strip():
                     raise ValueError(
                         f"contents[{content_index}].parts[{part_index}].file_path must be a non-empty string."
                     )
-                parts.append(_load_file_part(field_value))
+                parts.append(
+                    _load_file_part(
+                        field_value,
+                        media_resolution_policy=policy,
+                        media_resolution=media_resolution,
+                        field_name=media_resolution_field,
+                    )
+                )
+            else:
+                if not isinstance(field_value, str) or not field_value.strip():
+                    raise ValueError(
+                        f"contents[{content_index}].parts[{part_index}].file_uri must be a non-empty string."
+                    )
+                mime_type = part_spec.get("mime_type")
+                if not isinstance(mime_type, str) or not mime_type.strip():
+                    raise ValueError(f"contents[{content_index}].parts[{part_index}].mime_type is required for file_uri parts.")
+                parts.append(
+                    _load_uri_part(
+                        field_value,
+                        mime_type,
+                        media_resolution_policy=policy,
+                        media_resolution=media_resolution,
+                        field_name=media_resolution_field,
+                    )
+                )
 
         contents.append(types.Content(role=normalized_role, parts=parts))
 
@@ -682,6 +873,7 @@ def _generate_with_lease(
     include_thinking: bool,
     google_search: bool,
     response_json_schema: dict[str, Any] | None,
+    media_resolution_policy: dict[str, str] | None,
     normalized_history: list[HistoryTurn],
     lease: ApiKeyLease,
 ) -> dict[str, Any]:
@@ -694,7 +886,7 @@ def _generate_with_lease(
     started_at = time.perf_counter()
 
     file_parts = [
-        _call_with_retry(lambda path=file_path: _load_file_part(path))
+        _call_with_retry(lambda path=file_path: _load_file_part(path, media_resolution_policy=media_resolution_policy))
         for file_path in requested_files
     ]
     contents = _build_contents(prompt=prompt, file_parts=file_parts, history=normalized_history)
@@ -732,6 +924,7 @@ def _generate_request_with_lease(
     include_thinking: bool,
     google_search: bool,
     response_json_schema: dict[str, Any] | None,
+    media_resolution_policy: dict[str, str] | None,
     lease: ApiKeyLease,
 ) -> dict[str, Any]:
     client = genai.Client(
@@ -742,7 +935,7 @@ def _generate_request_with_lease(
     )
     started_at = time.perf_counter()
 
-    contents = _call_with_retry(lambda: _build_contents_from_spec(contents_spec))
+    contents = _call_with_retry(lambda: _build_contents_from_spec(contents_spec, media_resolution_policy))
     response = _call_with_retry(
         lambda: _call_api(
             client=client,
@@ -782,6 +975,7 @@ def generate(
     rate_limit_max_wait_seconds: float | int | None = None,
     google_search: bool = False,
     response_json_schema: dict[str, Any] | None = None,
+    media_resolution_policy: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Execute a single Gemini request from prompt plus local files."""
 
@@ -801,6 +995,7 @@ def generate(
         raise ValueError("google_search must be a boolean.")
     if response_json_schema is not None and not isinstance(response_json_schema, dict):
         raise ValueError("response_json_schema must be a JSON object.")
+    normalized_media_resolution_policy = normalize_media_resolution_policy(media_resolution_policy)
 
     normalized_history = _normalize_history(history)
     requested_files = files or []
@@ -839,6 +1034,7 @@ def generate(
                             include_thinking=include_thinking,
                             google_search=google_search,
                             response_json_schema=response_json_schema,
+                            media_resolution_policy=normalized_media_resolution_policy,
                             normalized_history=normalized_history,
                             lease=acquired.lease,
                         )
@@ -877,6 +1073,7 @@ def generate_request(
     rate_limit_max_wait_seconds: float | int | None = None,
     google_search: bool = False,
     response_json_schema: dict[str, Any] | None = None,
+    media_resolution_policy: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Execute a Gemini request from an ordered contents envelope."""
 
@@ -892,6 +1089,7 @@ def generate_request(
         raise ValueError("google_search must be a boolean.")
     if response_json_schema is not None and not isinstance(response_json_schema, dict):
         raise ValueError("response_json_schema must be a JSON object.")
+    normalized_media_resolution_policy = normalize_media_resolution_policy(media_resolution_policy)
 
     effective_system_prompt = (
         system_prompt.strip()
@@ -922,6 +1120,7 @@ def generate_request(
                             include_thinking=include_thinking,
                             google_search=google_search,
                             response_json_schema=response_json_schema,
+                            media_resolution_policy=normalized_media_resolution_policy,
                             lease=acquired.lease,
                         )
                     except Exception as exc:

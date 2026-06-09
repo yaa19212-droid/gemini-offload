@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -275,6 +276,131 @@ class GeminiClientTests(unittest.TestCase):
         self.assertEqual(len(result["images"]), 1)
         self.assertEqual(result["images"][0]["mime_type"], "image/png")
         self.assertEqual(result["images"][0]["data"], b"png-bytes")
+
+    def test_build_contents_applies_default_media_resolution_by_mime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            image_path = temp_path / "image.png"
+            pdf_path = temp_path / "doc.pdf"
+            video_path = temp_path / "clip.mp4"
+            audio_path = temp_path / "audio.mp3"
+            for path in (image_path, pdf_path, video_path, audio_path):
+                path.write_bytes(b"data")
+
+            contents = gemini_client._build_contents_from_spec(
+                [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"file_path": str(image_path)},
+                            {"file_path": str(pdf_path)},
+                            {"file_path": str(video_path)},
+                            {"file_path": str(audio_path)},
+                            {"text": "analyze"},
+                        ],
+                    }
+                ]
+            )
+
+        part_payloads = [
+            part.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for part in contents[0].parts
+        ]
+        self.assertEqual(
+            part_payloads[0]["mediaResolution"]["level"],
+            "MEDIA_RESOLUTION_ULTRA_HIGH",
+        )
+        self.assertEqual(
+            part_payloads[1]["mediaResolution"]["level"],
+            "MEDIA_RESOLUTION_HIGH",
+        )
+        self.assertEqual(
+            part_payloads[2]["mediaResolution"]["level"],
+            "MEDIA_RESOLUTION_HIGH",
+        )
+        self.assertNotIn("mediaResolution", part_payloads[3])
+        self.assertNotIn("mediaResolution", part_payloads[4])
+
+    def test_build_contents_applies_request_policy_and_part_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            image_path = temp_path / "image.png"
+            pdf_path = temp_path / "doc.pdf"
+            video_path = temp_path / "clip.mp4"
+            for path in (image_path, pdf_path, video_path):
+                path.write_bytes(b"data")
+
+            contents = gemini_client._build_contents_from_spec(
+                [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"file_path": str(image_path)},
+                            {"file_path": str(pdf_path), "media_resolution": "medium"},
+                            {"file_path": str(video_path), "media_resolution": "off"},
+                        ],
+                    }
+                ],
+                media_resolution_policy={"image": "high", "pdf": "low", "video": "high"},
+            )
+
+        part_payloads = [
+            part.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for part in contents[0].parts
+        ]
+        self.assertEqual(part_payloads[0]["mediaResolution"]["level"], "MEDIA_RESOLUTION_HIGH")
+        self.assertEqual(part_payloads[1]["mediaResolution"]["level"], "MEDIA_RESOLUTION_MEDIUM")
+        self.assertNotIn("mediaResolution", part_payloads[2])
+
+    def test_build_contents_rejects_invalid_media_resolution_combinations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            pdf_path = temp_path / "doc.pdf"
+            audio_path = temp_path / "audio.mp3"
+            text_path = temp_path / "notes.txt"
+            for path in (pdf_path, audio_path, text_path):
+                path.write_bytes(b"data")
+
+            invalid_cases = [
+                ({"file_path": str(pdf_path), "media_resolution": "ultra_high"}, "only supported for image"),
+                ({"file_path": str(audio_path), "media_resolution": "high"}, "not supported for audio"),
+                ({"file_path": str(text_path), "media_resolution": "low"}, "only supported for image, PDF, or video"),
+                ({"text": "hello", "media_resolution": "low"}, "not valid for text"),
+            ]
+            for part, message in invalid_cases:
+                with self.subTest(part=part):
+                    with self.assertRaisesRegex(ValueError, message):
+                        gemini_client._build_contents_from_spec([{"role": "user", "parts": [part]}])
+
+    def test_build_contents_uses_file_uri_media_resolution(self) -> None:
+        contents = gemini_client._build_contents_from_spec(
+            [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "file_uri": "gs://bucket/image.png",
+                            "mime_type": "image/png",
+                            "media_resolution": "ultra_high",
+                        },
+                        {
+                            "file_uri": "gs://bucket/doc.pdf",
+                            "mime_type": "application/pdf",
+                        },
+                    ],
+                }
+            ],
+            media_resolution_policy={"pdf": "medium"},
+        )
+
+        part_payloads = [
+            part.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for part in contents[0].parts
+        ]
+        self.assertEqual(part_payloads[0]["fileData"]["fileUri"], "gs://bucket/image.png")
+        self.assertEqual(part_payloads[0]["mediaResolution"]["level"], "MEDIA_RESOLUTION_ULTRA_HIGH")
+        self.assertEqual(part_payloads[1]["fileData"]["fileUri"], "gs://bucket/doc.pdf")
+        self.assertEqual(part_payloads[1]["mediaResolution"]["level"], "MEDIA_RESOLUTION_MEDIUM")
 
     def test_generate_retries_next_key_after_rate_limit(self) -> None:
         leases = [

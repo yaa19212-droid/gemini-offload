@@ -197,6 +197,113 @@ class ServerOutputTests(unittest.TestCase):
         self.assertEqual(properties["rate_limit"]["properties"]["mode"]["enum"], ["fail_fast", "wait"])
         self.assertIn("json_schema", properties["output"]["properties"])
         self.assertIn("json_schema_path", properties["output"]["properties"])
+        self.assertEqual(
+            properties["media_resolution"]["properties"]["image"]["default"],
+            "ultra_high",
+        )
+        self.assertEqual(
+            properties["media_resolution"]["properties"]["pdf"]["default"],
+            "high",
+        )
+        self.assertNotIn(
+            "ultra_high",
+            properties["media_resolution"]["properties"]["pdf"]["enum"],
+        )
+        self.assertNotIn(
+            "ultra_high",
+            properties["media_resolution"]["properties"]["video"]["enum"],
+        )
+        part_schema = request_schema["properties"]["contents"]["items"]["properties"]["parts"]["items"]
+        part_properties = part_schema["properties"]
+        self.assertIn("file_uri", part_properties)
+        self.assertIn("mime_type", part_properties)
+        self.assertEqual(
+            part_properties["media_resolution"]["enum"],
+            ["low", "medium", "high", "ultra_high", "off"],
+        )
+
+    def test_normalize_request_keeps_media_resolution_policy_and_file_uri_parts(self) -> None:
+        server = _load_server_module()
+
+        request = server._normalize_request(
+            {
+                "media_resolution": {"image": "high", "pdf": "medium", "video": "off"},
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "file_uri": "gs://bucket/doc.pdf",
+                                "mime_type": "application/pdf",
+                                "media_resolution": "low",
+                            },
+                            {"text": "OCR this."},
+                        ],
+                    }
+                ],
+            },
+            lifecycle="blocking",
+            run_dir=None,
+            item_id="one",
+        )
+
+        self.assertEqual(
+            request["media_resolution"],
+            {"image": "high", "pdf": "medium", "video": "off"},
+        )
+        self.assertEqual(
+            request["contents"][0]["parts"][0],
+            {
+                "file_uri": "gs://bucket/doc.pdf",
+                "mime_type": "application/pdf",
+                "media_resolution": "low",
+            },
+        )
+
+    def test_normalize_request_rejects_invalid_media_resolution_inputs(self) -> None:
+        server = _load_server_module()
+
+        invalid_requests = [
+            (
+                {
+                    "media_resolution": {"audio": "high"},
+                    "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+                },
+                "only supports keys",
+            ),
+            (
+                {
+                    "contents": [{"role": "user", "parts": [{"text": "hello", "media_resolution": "low"}]}],
+                },
+                "not valid for text",
+            ),
+            (
+                {
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [
+                                {
+                                    "file_uri": "gs://bucket/audio.mp3",
+                                    "mime_type": "audio/mpeg",
+                                    "media_resolution": "high",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                "not supported for audio",
+            ),
+        ]
+        for request, message in invalid_requests:
+            with self.subTest(request=request):
+                with self.assertRaisesRegex(ValueError, message):
+                    server._normalize_request(
+                        request,
+                        lifecycle="blocking",
+                        run_dir=None,
+                        item_id="one",
+                    )
 
     def test_inline_image_output_becomes_mcp_image_content(self) -> None:
         server = _load_server_module()
@@ -1045,8 +1152,9 @@ class ServerOutputTests(unittest.TestCase):
             rate_limit_max_wait_seconds,
             google_search,
             response_json_schema,
+            media_resolution_policy,
         ):
-            observed.append((google_search, response_json_schema))
+            observed.append((google_search, response_json_schema, media_resolution_policy))
             return {
                 "text": "ok",
                 "model": model,
@@ -1078,7 +1186,10 @@ class ServerOutputTests(unittest.TestCase):
 
         wrapped = anyio.run(run_generate)
 
-        self.assertEqual(observed, [(True, {"type": "object"})])
+        self.assertEqual(
+            observed,
+            [(True, {"type": "object"}, {"image": "ultra_high", "pdf": "high", "video": "high"})],
+        )
         result = wrapped.structuredContent["results"][0]
         self.assertEqual(result["response_json_error"].split(":", 1)[0], "JSONDecodeError")
         self.assertEqual(result["text"], "ok")

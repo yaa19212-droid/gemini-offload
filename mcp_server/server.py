@@ -26,12 +26,20 @@ from mcp.shared.exceptions import McpError
 from .gemini_client import (
     AVAILABLE_MODELS,
     DEFAULT_MODEL_NAME,
+    DEFAULT_MEDIA_RESOLUTION_POLICY,
     DEFAULT_RATE_LIMIT_MAX_WAIT_SECONDS,
     GeminiRateLimitError,
+    MEDIA_RESOLUTION_INPUT_VALUES,
+    MEDIA_RESOLUTION_POLICY_KEYS,
     MODEL_CHARACTERISTICS,
     RATE_LIMIT_MODE_FAIL_FAST,
+    detect_mime_type,
     detect_mime,
     generate_request,
+    is_supported_mime,
+    normalize_media_resolution_override,
+    normalize_media_resolution_policy,
+    validate_media_resolution_for_mime,
 )
 from .keys import get_key_count
 
@@ -556,26 +564,70 @@ def _normalize_contents(contents: Any) -> list[dict[str, Any]]:
         for part_index, part in enumerate(parts, start=1):
             if not isinstance(part, dict):
                 raise ValueError(f"contents[{content_index}].parts[{part_index}] must be an object.")
-            fields = [field for field in ("text", "text_path", "file_path") if field in part]
+            fields = [field for field in ("text", "text_path", "file_path", "file_uri") if field in part]
             if len(fields) != 1:
                 raise ValueError(
                     f"contents[{content_index}].parts[{part_index}] must contain exactly one of "
-                    "text, text_path, or file_path."
+                    "text, text_path, file_path, or file_uri."
                 )
             field = fields[0]
             value = part[field]
+            part_field_name = f"contents[{content_index}].parts[{part_index}]"
+            media_resolution = None
+            if "media_resolution" in part:
+                media_resolution = normalize_media_resolution_override(
+                    part["media_resolution"],
+                    f"{part_field_name}.media_resolution",
+                )
             if field == "text":
+                if media_resolution is not None:
+                    raise ValueError(f"{part_field_name}.media_resolution is not valid for text parts.")
+                if "mime_type" in part:
+                    raise ValueError(f"{part_field_name}.mime_type is only valid for file_uri parts.")
                 if not isinstance(value, str):
                     raise ValueError(f"contents[{content_index}].parts[{part_index}].text must be a string.")
                 normalized_parts.append({"text": value})
             elif field == "text_path":
+                if media_resolution is not None:
+                    raise ValueError(f"{part_field_name}.media_resolution is not valid for text_path parts.")
+                if "mime_type" in part:
+                    raise ValueError(f"{part_field_name}.mime_type is only valid for file_uri parts.")
                 normalized_parts.append(
                     {"text_path": _validate_absolute_path(value, f"contents[{content_index}].parts[{part_index}].text_path")}
                 )
+            elif field == "file_path":
+                if "mime_type" in part:
+                    raise ValueError(f"{part_field_name}.mime_type is only valid for file_uri parts.")
+                file_path = _validate_absolute_path(value, f"{part_field_name}.file_path")
+                if media_resolution is not None:
+                    validate_media_resolution_for_mime(
+                        detect_mime_type(file_path),
+                        media_resolution,
+                        f"{part_field_name}.media_resolution",
+                    )
+                normalized_part = {"file_path": file_path}
+                if media_resolution is not None:
+                    normalized_part["media_resolution"] = media_resolution
+                normalized_parts.append(normalized_part)
             else:
-                normalized_parts.append(
-                    {"file_path": _validate_absolute_path(value, f"contents[{content_index}].parts[{part_index}].file_path")}
-                )
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"{part_field_name}.file_uri must be a non-empty string.")
+                mime_type = part.get("mime_type")
+                if not isinstance(mime_type, str) or not mime_type.strip():
+                    raise ValueError(f"{part_field_name}.mime_type is required for file_uri parts.")
+                normalized_mime = mime_type.strip()
+                if not is_supported_mime(normalized_mime):
+                    raise ValueError(f"Unsupported MIME type for {part_field_name}.file_uri: {normalized_mime}")
+                if media_resolution is not None:
+                    validate_media_resolution_for_mime(
+                        normalized_mime,
+                        media_resolution,
+                        f"{part_field_name}.media_resolution",
+                    )
+                normalized_part = {"file_uri": value.strip(), "mime_type": normalized_mime}
+                if media_resolution is not None:
+                    normalized_part["media_resolution"] = media_resolution
+                normalized_parts.append(normalized_part)
         normalized_contents.append({"role": role.strip().lower(), "parts": normalized_parts})
     return normalized_contents
 
@@ -666,11 +718,13 @@ def _normalize_request(
     if not isinstance(include_thinking, bool):
         raise ValueError("request.include_thinking must be a boolean.")
     output = _normalize_output(request.get("output"), lifecycle=lifecycle, run_dir=run_dir, item_id=item_id)
+    media_resolution_policy = normalize_media_resolution_policy(request.get("media_resolution"))
     return {
         "model": model,
         "include_thinking": include_thinking,
         "system_prompt": _normalize_system(request.get("system")),
         "contents": _normalize_contents(request.get("contents")),
+        "media_resolution": media_resolution_policy,
         "output_path": output["path"],
         "expect_json_response": output["expect_json_response"],
         "response_json_schema": output["response_json_schema"],
@@ -888,6 +942,7 @@ async def _generate_raw_from_request(request: dict[str, Any]) -> tuple[dict[str,
             rate_limit.get("max_wait_seconds"),
             tools.get("google_search", False),
             request.get("response_json_schema"),
+            request.get("media_resolution"),
         )
     )
     return result, request.get("expect_json_response") is True
@@ -1148,13 +1203,27 @@ async def _execute_run_plan(
 
 
 def _call_gemini_input_schema() -> dict[str, Any]:
+    media_resolution_value_schema = {
+        "type": "string",
+        "enum": list(MEDIA_RESOLUTION_INPUT_VALUES),
+    }
+    non_image_media_resolution_value_schema = {
+        "type": "string",
+        "enum": [value for value in MEDIA_RESOLUTION_INPUT_VALUES if value != "ultra_high"],
+    }
     part_schema = {
         "type": "object",
-        "description": "Content part. Set exactly one of text, text_path, or file_path.",
+        "description": "Content part. Set exactly one of text, text_path, file_path, or file_uri.",
         "properties": {
             "text": {"type": "string"},
             "text_path": {"type": "string", "description": "Absolute path to a UTF-8 text file."},
             "file_path": {"type": "string", "description": "Absolute path to a local file part."},
+            "file_uri": {"type": "string", "description": "Remote file URI such as gs://bucket/object."},
+            "mime_type": {"type": "string", "description": "Required MIME type for file_uri parts."},
+            "media_resolution": {
+                **media_resolution_value_schema,
+                "description": "Optional per-file override. Applies only to image, PDF, and video parts.",
+            },
         },
         "additionalProperties": False,
     }
@@ -1182,6 +1251,25 @@ def _call_gemini_input_schema() -> dict[str, Any]:
                 "additionalProperties": False,
             },
             "contents": {"type": "array", "items": content_schema, "minItems": 1},
+            "media_resolution": {
+                "type": "object",
+                "description": (
+                    "Optional request-level defaults for image, PDF, and video parts. "
+                    "Omit for image=ultra_high, pdf=high, video=high."
+                ),
+                "properties": {
+                    key: {
+                        **(
+                            media_resolution_value_schema
+                            if key == "image"
+                            else non_image_media_resolution_value_schema
+                        ),
+                        "default": DEFAULT_MEDIA_RESOLUTION_POLICY[key],
+                    }
+                    for key in MEDIA_RESOLUTION_POLICY_KEYS
+                },
+                "additionalProperties": False,
+            },
             "output": {
                 "type": "object",
                 "properties": {
