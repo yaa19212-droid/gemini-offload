@@ -1273,7 +1273,37 @@ class ServerOutputTests(unittest.TestCase):
 
         self.assertNotIn("D:/", mcp_config)
         self.assertNotIn("C:/Users/", mcp_config)
+        self.assertNotIn("CLAUDE_PLUGIN_ROOT", mcp_config)
+        self.assertNotIn("CLAUDE_PLUGIN_ROOT", start_script)
         self.assertIn("./scripts/start-gemini-offload.ps1", mcp_config)
         self.assertIn("GEMINI_OFFLOAD_REPO", start_script)
         self.assertIn("GEMINI_OFFLOAD_OUTPUT_DIR", start_script)
         self.assertIn("mcp_server", start_script)
+
+    def test_plugin_workflow_skill_matches_repo_skill(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source_root = root / "skills" / "gemini-offload-workflows"
+        plugin_root = root / "plugins" / "gemini-offload" / "skills" / "gemini-offload-workflows"
+
+        source_files = {
+            path.relative_to(source_root): path
+            for path in source_root.rglob("*")
+            if path.is_file()
+        }
+        plugin_files = {
+            path.relative_to(plugin_root): path
+            for path in plugin_root.rglob("*")
+            if path.is_file()
+        }
+
+        self.assertEqual(set(plugin_files), set(source_files))
+        for relative_path, source_path in source_files.items():
+            with self.subTest(path=str(relative_path)):
+                self.assertEqual(
+                    plugin_files[relative_path].read_text(encoding="utf-8"),
+                    source_path.read_text(encoding="utf-8"),
+                )
+
+        skill_text = (source_root / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("file_uri", skill_text)
+        self.assertIn("media_resolution", skill_text)

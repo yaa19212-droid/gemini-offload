@@ -1,6 +1,6 @@
 ---
 name: gemini-offload-workflows
-description: Use when Codex needs to offload a bounded Gemini subtask through the local gemini-offload MCP server, especially OCR, transcription, flexible plain-text multimodal analysis, file-grounded extraction, optional strict JSON schema output, Google Search grounding, text cleanup, background runs, or concurrent item processing. Prefer this skill when the main agent should keep context small, large outputs should be written to disk, source material should be sampled before a run, or reusable prompts/templates should be loaded from path.
+description: Use when Codex needs to offload a bounded Gemini subtask through the local gemini-offload MCP server, especially OCR, transcription, flexible plain-text multimodal analysis, file-grounded extraction, remote file URI input, media resolution defaults or overrides, optional strict JSON schema output, Google Search grounding, text cleanup, background runs, or concurrent item processing. Prefer this skill when the main agent should keep context small, large outputs should be written to disk, source material should be sampled before a run, or reusable prompts/templates should be loaded from path.
 ---
 
 # Gemini Offload Workflows
@@ -112,7 +112,7 @@ OCR one chunk, blocking:
     "id": "chunk-01",
     "request": {
       "model": "gemini-3.1-pro-preview",
-      "system": {"path": "D:/gemini-offload/prompts/ocr_system.md"},
+      "system": {"path": "D:/path/to/gemini-offload/prompts/ocr_system.md"},
       "contents": [{"role": "user", "parts": [
         {"file_path": "D:/work/input/chunk-01.pdf"},
         {"text": "Convert this chunk to clean markdown."}
