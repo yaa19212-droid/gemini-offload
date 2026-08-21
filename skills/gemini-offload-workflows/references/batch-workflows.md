@@ -43,10 +43,17 @@ whole result set.
 For long runs:
 
 1. Start `call_gemini` with background lifecycle.
-2. Save `run_id`, `run_dir`, `status_path`, and `events_path`.
-3. Use `manage_gemini_run` with `status` or `progress`.
-4. Read only newly appended events by offset.
-5. Inspect failed items or sampled successful output files.
+2. Save `run_id` and `run_dir`; returned status/event paths are compatibility
+   views, not the authoritative state store.
+3. Use `manage_gemini_run` with `status` or `progress`. These actions read the
+   committed SQLite run store; `progress` is cursorable by event sequence.
+4. Inspect failed items or sampled successful output files rather than rereading
+   whole run exports.
+5. Use `stop` for a resumable stop, `cancel` for intentional termination, and
+   `resume` only after checking status/liveness.
 6. Assemble final artifacts locally from saved output paths.
 
-Avoid loading every saved output or the full event log into the main context.
+Resume skips a completed item only when its recorded artifacts still match the
+stored byte count and SHA-256 digest. Missing or tampered outputs are recovered
+as pending and run again. Avoid loading every saved output or the full
+compatibility event log into the main context.

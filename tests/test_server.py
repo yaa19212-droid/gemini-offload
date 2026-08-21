@@ -4,6 +4,7 @@ import base64
 import importlib
 import json
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -731,17 +732,118 @@ class ServerOutputTests(unittest.TestCase):
             run_dir = Path(data["run_dir"])
 
             self.assertEqual(data["lifecycle"], "background")
-            self.assertEqual(data["status"], "running")
+            self.assertEqual(data["status"], "starting")
             self.assertTrue((run_dir / "plan.json").exists())
             self.assertTrue((run_dir / "status.json").exists())
             self.assertTrue((run_dir / "events.jsonl").exists())
             self.assertTrue((run_dir / "locator.json").exists())
             plan = json.loads((run_dir / "plan.json").read_text(encoding="utf-8"))
-            self.assertTrue(plan["items"][0]["request"]["output_path"].endswith("outputs\\p1.txt") or plan["items"][0]["request"]["output_path"].endswith("outputs/p1.txt"))
+            item = plan["items"][0]
+            self.assertEqual(item["id"], "p1")
+            self.assertEqual(item["storage_key"], "item-000001")
+            self.assertTrue(item["request"]["output_managed"])
+            self.assertEqual(Path(item["request"]["output_path"]).name, "item-000001.txt")
             self.assertEqual(
                 wrapped.content[0].text,
                 "Background Gemini run started. Use structuredContent paths and manage_gemini_run for progress.",
             )
+
+    def test_background_item_id_is_not_used_as_managed_filename(self) -> None:
+        server = _load_server_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(os.environ, {server.ENV_RUN_DIR: temp_dir}, clear=False):
+                plan = server._normalize_run_plan(
+                    {
+                        "execution": {"lifecycle": "background"},
+                        "items": [_text_item("../../outside", "OCR this.")],
+                    }
+                )
+
+            item = plan["items"][0]
+            output_path = Path(item["request"]["output_path"])
+            self.assertEqual(item["id"], "../../outside")
+            self.assertEqual(item["storage_key"], "item-000001")
+            self.assertEqual(output_path.name, "item-000001.txt")
+            self.assertEqual(output_path.parent, Path(plan["run_dir"]) / "outputs")
+
+    def test_background_explicit_output_path_remains_unmanaged(self) -> None:
+        server = _load_server_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as output_dir:
+            explicit_path = Path(output_dir) / "caller-selected.txt"
+            with patch.dict(os.environ, {server.ENV_RUN_DIR: temp_dir}, clear=False):
+                plan = server._normalize_run_plan(
+                    {
+                        "execution": {"lifecycle": "background"},
+                        "items": [
+                            _text_item(
+                                "opaque/id",
+                                "OCR this.",
+                                output={"path": str(explicit_path)},
+                            )
+                        ],
+                    }
+                )
+
+            request = plan["items"][0]["request"]
+            self.assertEqual(request["output_path"], str(explicit_path))
+            self.assertFalse(request["output_managed"])
+            self.assertNotEqual(explicit_path.parent, Path(plan["run_dir"]) / "outputs")
+
+    def test_run_plan_rejects_duplicate_item_ids(self) -> None:
+        server = _load_server_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(os.environ, {server.ENV_RUN_DIR: temp_dir}, clear=False):
+                with self.assertRaisesRegex(ValueError, "item ids must be unique"):
+                    server._normalize_run_plan(
+                        {
+                            "execution": {"lifecycle": "background"},
+                            "items": [_text_item("same", "one"), _text_item("same", "two")],
+                        }
+                    )
+
+    def test_manage_run_rejects_traversal_and_out_of_root_run_dirs(self) -> None:
+        server = _load_server_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside_dir:
+            with patch.dict(os.environ, {server.ENV_RUN_DIR: temp_dir}, clear=False):
+                with self.assertRaisesRegex(ValueError, "managed run identifier"):
+                    server._run_dir_from_args({"run_id": "run-../escape"})
+
+                outside_run = Path(outside_dir) / "run-outside"
+                with self.assertRaisesRegex(ValueError, "immediate child"):
+                    server._run_dir_from_args({"run_dir": str(outside_run)})
+
+    def test_manage_run_rejects_symlink_escape_when_supported(self) -> None:
+        server = _load_server_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside_dir:
+            run_root = Path(temp_dir)
+            outside_run = Path(outside_dir) / "run-linked"
+            outside_run.mkdir()
+            linked_run = run_root / "run-linked"
+            try:
+                os.symlink(outside_run, linked_run, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"directory symlinks are unavailable: {exc}")
+
+            with patch.dict(os.environ, {server.ENV_RUN_DIR: str(run_root)}, clear=False):
+                with self.assertRaisesRegex(ValueError, "immediate child"):
+                    server._run_dir_from_args({"run_dir": str(linked_run)})
+
+    def test_atomic_text_write_preserves_old_content_when_replace_fails(self) -> None:
+        server = _load_server_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "result.txt"
+            target.write_text("old", encoding="utf-8")
+            with patch.object(server.os, "replace", side_effect=OSError("replace failed")):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    server._atomic_write_text(target, "new")
+            self.assertEqual(target.read_text(encoding="utf-8"), "old")
+            self.assertEqual(list(Path(temp_dir).glob(".result.txt.*.tmp")), [])
 
     def test_background_worker_writes_outputs_status_and_progress_events(self) -> None:
         server = _load_server_module()
@@ -768,9 +870,18 @@ class ServerOutputTests(unittest.TestCase):
                 (run_dir / "control").mkdir(parents=True, exist_ok=True)
                 (run_dir / "outputs").mkdir(parents=True, exist_ok=True)
                 server._write_json(run_dir / "plan.json", plan)
+                server._write_status(run_dir, server._initial_status(plan, "starting"))
+                lease_generation = server._run_store().acquire_lease(
+                    plan["run_id"], "token", owner_pid=1
+                )
                 server._write_json(
                     run_dir / "locator.json",
-                    {"run_id": plan["run_id"], "run_token": "token", "pid": 1},
+                    {
+                        "run_id": plan["run_id"],
+                        "run_token": "token",
+                        "lease_generation": lease_generation,
+                        "pid": 1,
+                    },
                 )
 
                 with patch.object(server, "generate_request", fake_generate_request):
@@ -788,6 +899,10 @@ class ServerOutputTests(unittest.TestCase):
             self.assertGreaterEqual(len(progress["events"]), 3)
             self.assertEqual(progress["next_event_offset"], len(progress["events"]))
             self.assertIn(plan["run_id"], [run["run_id"] for run in listed["runs"]])
+            stored_status = server.RunStore(temp_dir).read_run_snapshot(plan["run_id"])
+            stored_events = server.RunStore(temp_dir).list_events(plan["run_id"])
+            self.assertEqual(stored_status["status"], "completed")
+            self.assertGreaterEqual(len(stored_events), 3)
 
     def test_manage_gemini_run_stop_cancel_and_resume_write_control_and_spawn(self) -> None:
         server = _load_server_module()
@@ -820,10 +935,135 @@ class ServerOutputTests(unittest.TestCase):
                 with patch.object(server, "_spawn_worker", fake_spawn):
                     resume_result = server._manage_gemini_run({"action": "resume", "run_dir": str(run_dir)})
 
-                self.assertEqual(resume_result["status"], "running")
+                self.assertEqual(resume_result["status"], "starting")
                 self.assertEqual(resume_result["pid"], 5678)
                 self.assertFalse((run_dir / "control" / "stop.json").exists())
                 self.assertFalse((run_dir / "control" / "cancel.json").exists())
+
+    def test_concurrent_resume_attempts_spawn_only_one_worker(self) -> None:
+        server = _load_server_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(os.environ, {server.ENV_RUN_DIR: temp_dir}, clear=False):
+                plan = server._normalize_run_plan(
+                    {
+                        "execution": {"lifecycle": "background"},
+                        "items": [_text_item("p1", "OCR this.")],
+                    }
+                )
+                run_dir = Path(plan["run_dir"])
+                server._write_json(run_dir / "plan.json", plan)
+                failed = server._initial_status(plan, "failed")
+                server._write_status(run_dir, failed)
+
+                barrier = threading.Barrier(2)
+                lock = threading.Lock()
+                spawned: list[str] = []
+                outcomes: list[tuple[str, object]] = []
+
+                def fenced_spawn(run_dir_arg, run_id, run_token):
+                    barrier.wait(timeout=5)
+                    generation = server._run_store().acquire_lease(run_id, run_token)
+                    with lock:
+                        spawned.append(run_token)
+                    locator = {
+                        "run_id": run_id,
+                        "pid": 6000 + generation,
+                        "create_time": 1.0,
+                        "run_token": run_token,
+                        "lease_generation": generation,
+                    }
+                    server._write_json(Path(run_dir_arg) / "locator.json", locator)
+                    return locator
+
+                def resume() -> None:
+                    try:
+                        result = server._manage_gemini_run(
+                            {"action": "resume", "run_dir": str(run_dir)}
+                        )
+                        outcome: tuple[str, object] = ("ok", result["pid"])
+                    except ValueError as exc:
+                        outcome = ("error", str(exc))
+                    with lock:
+                        outcomes.append(outcome)
+
+                with patch.object(server, "_spawn_worker", fenced_spawn):
+                    threads = [threading.Thread(target=resume) for _ in range(2)]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(timeout=10)
+
+                self.assertTrue(all(not thread.is_alive() for thread in threads))
+                self.assertEqual([kind for kind, _ in outcomes].count("ok"), 1)
+                self.assertEqual([kind for kind, _ in outcomes].count("error"), 1)
+                self.assertEqual(len(spawned), 1)
+                self.assertIn("active worker lease", next(value for kind, value in outcomes if kind == "error"))
+                server._run_store().revoke_lease(plan["run_id"])
+
+    def test_force_cancel_revokes_worker_fence_and_persists_canceled(self) -> None:
+        server = _load_server_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(os.environ, {server.ENV_RUN_DIR: temp_dir}, clear=False):
+                plan = server._normalize_run_plan(
+                    {
+                        "execution": {"lifecycle": "background"},
+                        "items": [_text_item("p1", "OCR this.")],
+                    }
+                )
+                run_dir = Path(plan["run_dir"])
+                server._write_json(run_dir / "plan.json", plan)
+                status = server._initial_status(plan, "running")
+                server._write_status(run_dir, status)
+                generation = server._run_store().acquire_lease(plan["run_id"], "token")
+                with patch.object(
+                    server,
+                    "_terminate_verified_process_tree",
+                    return_value={"all_gone": True, "terminated": True, "termination_failed": False, "alive_pids": []},
+                ):
+                    result = server._manage_gemini_run(
+                        {"action": "cancel", "run_dir": str(run_dir), "force": True}
+                    )
+                self.assertTrue(result["forced_termination"])
+                self.assertEqual(server._run_store().read_run_snapshot(plan["run_id"])["status"], "canceled")
+                self.assertFalse(server._run_store().lease_matches(plan["run_id"], generation, "token"))
+
+    def test_recorded_artifact_verification_detects_tampering(self) -> None:
+        server = _load_server_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_root = Path(temp_dir) / "runs"
+            run_dir = run_root / "run-artifact-check"
+            outputs = run_dir / "outputs"
+            outputs.mkdir(parents=True)
+            output = outputs / "item-000001.txt"
+            output.write_text("original", encoding="utf-8")
+            with patch.dict(os.environ, {server.ENV_RUN_DIR: str(run_root)}):
+                metadata = server._artifact_metadata(output, role="output", managed=True)
+                self.assertEqual(server._verify_recorded_artifacts(run_dir, [metadata]), (True, "verified"))
+                output.write_text("tampered", encoding="utf-8")
+                verified, reason = server._verify_recorded_artifacts(run_dir, [metadata])
+                self.assertFalse(verified)
+                self.assertIn("mismatch", reason)
+
+    def test_reconcile_stale_running_run_marks_failed(self) -> None:
+        server = _load_server_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_root = Path(temp_dir) / "runs"
+            run_dir = run_root / "run-stale"
+            run_dir.mkdir(parents=True)
+            with patch.dict(os.environ, {server.ENV_RUN_DIR: str(run_root)}):
+                status = {
+                    "run_id": "run-stale",
+                    "lifecycle": "background",
+                    "status": "running",
+                    "items": [{"id": "a", "index": 0, "status": "running"}],
+                }
+                server._run_store().persist_status_snapshot(status)
+                reconciled = server._reconcile_stale_runs()
+                self.assertEqual(reconciled, ["run-stale"])
+                recovered = server._run_store().read_run_snapshot("run-stale")
+                self.assertEqual(recovered["status"], "failed")
+                self.assertEqual(server._run_store().list_events("run-stale")[-1]["event"], "run_recovered_failed")
 
     def test_call_gemini_runs_items_concurrently(self) -> None:
         server = _load_server_module()
@@ -1300,10 +1540,38 @@ class ServerOutputTests(unittest.TestCase):
         for relative_path, source_path in source_files.items():
             with self.subTest(path=str(relative_path)):
                 self.assertEqual(
-                    plugin_files[relative_path].read_text(encoding="utf-8"),
-                    source_path.read_text(encoding="utf-8"),
+                    plugin_files[relative_path].read_bytes(),
+                    source_path.read_bytes(),
                 )
 
         skill_text = (source_root / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("file_uri", skill_text)
         self.assertIn("media_resolution", skill_text)
+        self.assertIn("SQLite run store", skill_text)
+
+    def test_package_server_and_plugin_versions_match(self) -> None:
+        server = _load_server_module()
+        root = Path(__file__).resolve().parents[1]
+        pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+        package_version = next(
+            line.split('"')[1]
+            for line in pyproject.splitlines()
+            if line.startswith("version = ")
+        )
+        plugin = json.loads(
+            (root / "plugins" / "gemini-offload" / ".codex-plugin" / "plugin.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(package_version, "0.2.0")
+        self.assertEqual(server.SERVER_VERSION, package_version)
+        self.assertEqual(plugin["version"], package_version)
+
+    def test_hook_reads_authoritative_run_store(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        hook = (
+            root / "plugins" / "gemini-offload" / "hooks" / "gemini_run_status.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("RunStore", hook)
+        self.assertIn("DEFAULT_DB_NAME", hook)
+        self.assertNotIn('glob("run-*/status.json")', hook)

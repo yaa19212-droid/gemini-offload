@@ -78,6 +78,11 @@ Plain text and JSON schema are both first-class output modes.
   `results_path`.
 - Background starts return `run_id`, `run_dir`, `status_path`, `events_path`,
   and guidance. Use `manage_gemini_run` for progress.
+- Omitted background `output.path` creates a managed file under
+  `<run_dir>/outputs/` using an index-derived storage key; caller item IDs stay
+  metadata and are not used as filenames.
+- Explicit absolute `output.path` remains supported as a caller-selected output
+  and is not treated as a managed run artifact path.
 
 ## Read References When Needed
 
@@ -99,8 +104,10 @@ Use background lifecycle when waiting would block Codex for a long time:
 5. Use `stop` to pause after current work, `cancel` to terminate intent, and
    `resume` when a partial run can continue.
 
-Background run logs are debugging/audit records. Live status comes from
-`manage_gemini_run`, which checks runtime state when possible.
+Background run state is authoritative in the SQLite run store. Use
+`manage_gemini_run` for status/progress/control; it reads committed durable state
+and may supplement it with verified OS-process liveness. Per-run `status.json`
+and `events.jsonl` are compatibility/debug exports, not source of truth.
 
 ## Common Call Shapes
 
@@ -169,6 +176,9 @@ Grounded short answer:
   fields.
 - Background worker liveness can be `unknown`; use `manage_gemini_run status`
   before assuming a run is still active.
+- Resume trusts a completed item only after recorded output artifacts pass size
+  and SHA-256 verification. Missing or tampered outputs are re-executed rather
+  than silently skipped.
 - Do not read full output files, manifests, or event logs unless required.
 
 ## Minimal Checklist

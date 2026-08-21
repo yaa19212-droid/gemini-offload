@@ -1,6 +1,6 @@
 {
   "name": "gemini-offload",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Codex plugin that bundles the run-oriented gemini-offload MCP server and workflow skill for bounded plain-text or structured Gemini subtasks.",
   "author": {
     "name": "yaa19212-droid",

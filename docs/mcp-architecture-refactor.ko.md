@@ -15,6 +15,49 @@
 - `code_execution`은 미래 설계 주제로만 남기고, 이번 리팩터링에서는
   제외한다.
 
+## 구현된 Durable Runtime (0.2.0)
+
+현재 background runtime의 authoritative state는 run root 아래의 SQLite WAL
+데이터베이스다. `runs`, `items`, `artifacts`, `events`, `worker_leases`를
+관계형 테이블로 저장하며 schema version과 명시적 transaction 경계를 둔다.
+각 run의 `status.json`과 `events.jsonl`은 호환/디버그용 export일 뿐 source of
+truth가 아니다.
+
+run 상태(`queued`, `starting`, `running`, `stopping`, `canceling`, `completed`,
+`failed`, `stopped`, `canceled`)와 item 상태(`pending`, `running`, `completed`,
+`failed`, `stopped`, `canceled`)는 명시적 state machine으로 검증된다. 상태
+변경과 대응 event는 가능한 경우 같은 SQLite transaction에서 commit된다.
+
+worker ownership은 단조 증가하는 lease generation과 random token으로 fence된다.
+worker의 상태/아티팩트 변경 transaction은 같은 fence를 commit 전에 다시
+검증한다. heartbeat가 lease를 갱신하고, forced cancel은 terminal cancel을
+commit하기 전에 lease를 revoke하므로 stale worker가 나중에 결과를 publish할
+수 없다.
+
+자동 관리되는 background output은 `<run_dir>/outputs/` 아래에 갇히며 item
+index 기반 storage key를 쓴다. caller item ID는 opaque metadata이며 파일명이
+되지 않는다. 사용자가 명시한 absolute `output.path`는 계속 지원하지만 managed
+artifact와 구분해서 기록한다.
+
+`completed` item은 기록된 모든 artifact가 regular file로 남아 있고 byte count와
+SHA-256이 일치할 때만 resume에서 skip된다. 누락/변조된 artifact는 item을
+pending으로 되돌려 다시 실행하고 recovery event를 남긴다. active lease가 없는
+stale `starting`/`running`은 `failed`, `stopping`은 `stopped`, `canceling`은
+`canceled`로 복구된다.
+
+구현 책임은 다음과 같이 분리되어 있다.
+
+- `run_store.py`: SQLite state, transition, event, lease/fencing.
+- `artifacts.py`: managed path confinement, atomic write, hash/validation.
+- `output_policy.py`: text/JSON/image spill과 compact return policy.
+- `run_service.py`: request materialization과 run/item orchestration.
+- `worker.py` / `run_worker.py`: worker process lifecycle과 background entrypoint.
+- `server.py`: MCP schema/handler, compact result wrapping, narrow adapter.
+- `gemini_client.py` / `keys.py`: Gemini API와 quota/credential.
+
+`run_worker.py`는 MCP transport layer와 결합되지 않도록 `server.py`가 아니라
+`worker.py`를 직접 import한다.
+
 ## 핵심 모델
 
 중심 단위는 run이다.
@@ -320,71 +363,39 @@ history지만, live process state에 대한 authority는 아니다.
 
 ### Live Runtime State
 
-management tool은 registry log에서 liveness를 추론하지 말고 live runtime
-state를 inspect해야 한다.
+durable lifecycle state는 SQLite에서 온다. OS process inspection은 liveness와
+process control을 위한 supporting evidence이며 별도의 state authority가 아니다.
+`manage_gemini_run list/status/progress`는 durable store를 조회하고, status/control
+응답은 필요할 때 `locator.json`의 PID/create-time/run token을 OS process table과
+대조한다.
 
-선호하는 architecture:
+active worker는 `(run_id, generation, token)` SQLite lease를 소유하고 heartbeat로
+expiry를 갱신한다. generation은 단조 증가하므로 run이 reclaim되면 모든 이전
+worker가 fence된다. stale worker가 이미 진행 중이던 Gemini 요청을 끝낼 수는
+있지만 이후 state나 artifact를 commit할 수는 없다.
 
-- `call_gemini`는 각 background run을 supervised worker process로 시작하거나,
-  동등한 live handle을 가진 supervised task로 시작한다.
-- run directory는 `run_id`, worker pid, worker start token, control channel
-  path, plan path, output directory 같은 durable locator data를 저장한다.
-- MCP server가 아직 live worker handle을 소유하고 있다면 `manage_gemini_run`은
-  그 handle을 확인한다.
-- MCP server가 restart되었다면 `manage_gemini_run`은 locator data를 사용해 OS
-  process table을 inspect하고, run token 또는 command line으로 worker identity를
-  검증한다.
-- heartbeat file 또는 status snapshot은 active, waiting, stale, unknown state를
-  구분하는 데 도움을 줄 수 있지만, sole authority가 아니라 supporting
-  evidence다.
+### Background Durable Store와 Compatibility Export
 
-가능한 live status:
+authoritative registry는 run root의 `.gemini-offload-runs.sqlite3`이며 SQLite WAL
+mode를 사용한다. run/item의 query-critical state, artifact integrity metadata,
+event, worker lease를 저장하고 상태 변경과 대응 event를 transaction으로 묶는다.
 
-- `running`
-- `waiting_rate_limit`
-- `stopping`
-- `canceling`
-- `stopped`
-- `completed`
-- `failed`
-- `unknown`
+각 run directory의 `plan.json`, `status.json`, `events.jsonl`, `locator.json`,
+`control/`, `outputs/`는 계속 유지된다. 이 중 `status.json`과 `events.jsonl`은
+compatibility/audit/debug export이므로 SQLite와 불일치할 때 authority로 사용하면
+안 된다. cursorable event 조회는 `manage_gemini_run progress`를 사용한다.
 
-`unknown`은 durable file상으로는 run이 존재해야 하지만 management tool이 현재
-liveness를 증명할 수 없다는 뜻이다. 예시는 missing process, stale heartbeat,
-matching worker handle 없이 restart된 MCP server, identity를 검증할 수 없는
-worker process다.
+control semantics는 다음과 같다.
 
-### Background Registry
+- `stop`: `stopping`을 거쳐 `stopped`로 가며 resume 가능하다.
+- `cancel`: `canceling`을 거쳐 `canceled`로 간다. forced cancel은 terminal state
+  commit 전에 lease를 revoke한다.
+- `resume`: 기존 control file을 지우고 `starting`으로 전이한 뒤 새 lease
+  generation을 획득하며 non-terminal 또는 artifact-invalid item만 다시 실행한다.
 
-background run에는 disk에 남는 append-friendly registry가 필요하다. registry는
-에이전트가 매번 전체 history를 다시 읽지 않고 새로 append된 내용만 확인할
-수 있어야 한다.
-
-최소 registry content:
-
-- run id
-- lifecycle
-- start timestamp
-- latest status timestamp
-- item ids
-- output paths
-- manifest path 또는 run directory
-- append-only progress events
-- timestamp, item id, error type, message를 포함한 error events
-- completion events
-- cancellation events
-
-registry를 process liveness의 source of truth로 취급해서는 안 된다. process
-liveness는 runtime state이며 직접 확인해야 한다. 마찬가지로 cancel, stop,
-resume은 runtime control이다. static registry file을 읽거나 수정하는 것만으로는
-신뢰성 있게 구현할 수 없다.
-
-registry는 append-only event로 관찰된 liveness check와 management action을
-기록할 수 있다. 여기에는 unknown state, rate-limit waiting, cancellation
-request, stop request, resume attempt가 포함될 수 있다.
-
-registry는 주로 debugging과 audit artifact로 취급해야 한다. Runtime state는
-worker handle, OS process inspection, current worker status에서 와야 한다.
+startup recovery는 durable state와 lease를 함께 사용한다. active lease가 없는
+stale `starting`/`running`은 `failed`, `stopping`은 `stopped`, `canceling`은
+`canceled`로 정리된다.
 
 ### Codex Hooks
 
@@ -552,16 +563,18 @@ referenced template은 다음과 같은 request envelope로 materialize될 수 �
 }
 ```
 
-## 열린 질문
+## 구현 후 정리
 
-- registry log는 자신이 live state authority인 척하지 않으면서 observed
-  liveness check, unknown state, rate-limit waiting, resume attempt를 어떻게
-  표현해야 하는가?
-- background run은 기본적으로 in-process supervised task, child worker process,
-  detached worker process 중 무엇이어야 하는가?
-- worker identity verification과 process-tree cancellation의 정확한 Windows
-  implementation은 무엇인가?
-- Codex app-server는 Codex Desktop plugin on Windows에서 사용할 수 있는가,
-  아니면 separate client integration surface일 뿐인가?
-- session이 idle 상태일 때 external background run 완료가 새 response를
-  trigger할 수 있게 하는 Codex Desktop API가 hooks/app-server 외에 있는가?
+초기 설계 단계에서 열려 있던 runtime 질문은 0.2.0 구현에서 다음과 같이
+정리되었다.
+
+- background 실행은 child worker process를 사용한다.
+- worker identity는 PID/create time/run token과 SQLite lease fence로 검증한다.
+- hard cancel은 검증된 process tree를 종료하고 lease를 revoke한다.
+- JSONL registry 대신 SQLite WAL이 authoritative state store가 되었고 JSONL은
+  audit/debug compatibility export로 남았다.
+- Codex hook은 optional context-injection helper이며 worker나 state authority가
+  아니다.
+- 구현 과정의 세부 발견, 타협, 검증 결과는 `IMPLEMENTATION_LOG.md`에 기록한다.
+
+이 문서에서 사용자의 추가 조사를 기다리는 runtime 설계 질문은 없다.

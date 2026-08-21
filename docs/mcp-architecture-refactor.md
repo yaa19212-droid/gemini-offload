@@ -14,6 +14,52 @@ promoted to top-level modes.
 - Keep plain text and JSON schema output as first-class choices.
 - Leave `code_execution` as a future design topic, not part of this refactor.
 
+## Implemented Durable Runtime (0.2.0)
+
+The current implementation uses a SQLite WAL database under the configured run
+root as the authoritative background-run store. `runs`, `items`, `artifacts`,
+`events`, and `worker_leases` are relational tables with schema versioning and
+explicit transactions. Per-run `status.json` and `events.jsonl` files are
+compatibility/debug exports; they are not source of truth.
+
+Run state transitions are enforced (`queued`, `starting`, `running`, `stopping`,
+`canceling`, `completed`, `failed`, `stopped`, `canceled`) and item transitions
+are likewise explicit (`pending`, `running`, `completed`, `failed`, `stopped`,
+`canceled`). A state mutation and its corresponding event are committed in the
+same SQLite transaction where applicable.
+
+Worker ownership uses a monotonically increasing lease generation and random
+token. Worker state/artifact mutations verify that fence inside the transaction
+that publishes them. Heartbeats renew the lease; forced cancellation revokes it
+before terminal cancellation is committed, preventing a stale worker from
+publishing after ownership changes.
+
+Managed background outputs are confined beneath `<run_dir>/outputs/` and use
+index-derived storage keys. Caller item IDs remain opaque metadata and never
+become filesystem names. Explicit caller-provided absolute output paths remain
+supported, but are recorded as unmanaged/user-selected artifacts.
+
+Completed items are resumable without re-execution only when all recorded
+artifacts still exist as regular files and match recorded byte counts and
+SHA-256 digests. Missing or tampered artifacts transition back to pending and
+produce a recovery event. Startup recovery maps stale `starting`/`running` runs
+without a live lease to `failed`, `stopping` to `stopped`, and `canceling` to
+`canceled`.
+
+The implementation is separated by responsibility:
+
+- `run_store.py`: durable SQLite state, transitions, events, leases/fencing.
+- `artifacts.py`: managed path confinement, atomic writes, hashes, validation.
+- `output_policy.py`: text/JSON/image spill and compact return policy.
+- `run_service.py`: request materialization and run/item orchestration.
+- `worker.py` / `run_worker.py`: worker process lifecycle and background entrypoint.
+- `server.py`: MCP schemas/handlers, compact result wrapping, and narrow adapters.
+- `gemini_client.py` / `keys.py`: Gemini API and quota/credential concerns.
+
+`run_worker.py` intentionally imports `worker.py` directly rather than importing
+the MCP transport server, so background execution does not depend on the stdio
+transport layer.
+
 ## Core Model
 
 The central unit is a run.
@@ -316,72 +362,42 @@ file is useful history, but it is not an authority for live process state.
 
 ### Live Runtime State
 
-The management tool should inspect live runtime state, not infer liveness from
-the registry log.
+Durable lifecycle state comes from SQLite; OS process inspection is supporting
+evidence for liveness and process control rather than a competing state store.
+`manage_gemini_run list/status/progress` queries the durable run store. Status and
+control paths may additionally validate `locator.json` against the OS process table
+using PID, process creation time, and the run token.
 
-Preferred architecture:
+An active worker owns a SQLite lease `(run_id, generation, token)` with heartbeat
+expiry. The generation is monotonic, so a reclaimed run fences out every older
+worker. A worker may finish an in-flight external Gemini request after losing its
+lease, but it cannot commit state or publish output artifacts afterward.
 
-- `call_gemini` starts each background run as a supervised worker process, or as
-  a supervised task with an equivalent live handle.
-- The run directory stores durable locator data such as `run_id`, worker pid,
-  worker start token, control channel path, plan path, and output directory.
-- `manage_gemini_run` checks the live worker handle when the MCP server still
-  owns it.
-- If the MCP server was restarted, `manage_gemini_run` uses the locator data to
-  inspect the OS process table and verify the worker identity with the run token
-  or command line.
-- A heartbeat file or status snapshot can help distinguish active, waiting,
-  stale, and unknown states, but it is supporting evidence rather than the sole
-  authority.
+### Background Durable Store And Compatibility Exports
 
-Possible live statuses:
+The authoritative registry is `.gemini-offload-runs.sqlite3` in the run root,
+using SQLite WAL mode. It stores query-critical run/item states relationally plus
+artifact integrity metadata, events, and worker leases. Status mutations and their
+corresponding events are committed transactionally.
 
-- `running`
-- `waiting_rate_limit`
-- `stopping`
-- `canceling`
-- `stopped`
-- `completed`
-- `failed`
-- `unknown`
+Each run directory still exposes `plan.json`, `status.json`, `events.jsonl`,
+`locator.json`, `control/`, and `outputs/`. These files serve compatibility, audit,
+and targeted debugging needs. In particular, `status.json` and `events.jsonl` are
+exports from committed state and must not be used as authority when they disagree
+with SQLite. `manage_gemini_run progress` provides the supported cursorable event
+view.
 
-`unknown` means the durable files say a run should exist, but the management
-tool cannot prove current liveness. Examples include a missing process, a stale
-heartbeat, a restarted MCP server without a matching worker handle, or a worker
-process whose identity cannot be verified.
+Control semantics are:
 
-### Background Registry
+- `stop`: transition toward `stopping`, then `stopped`; the run is resumable.
+- `cancel`: transition toward `canceling`, then `canceled`; forced cancel revokes
+  the lease before terminal publication.
+- `resume`: clear old control files, transition to `starting`, acquire a new lease
+  generation, and re-run only non-terminal or artifact-invalid items.
 
-A background run needs an append-friendly registry on disk. The registry must
-let an agent inspect only newly appended content instead of rereading the whole
-history every time.
-
-Minimum registry content:
-
-- run id
-- lifecycle
-- start timestamp
-- latest status timestamp
-- item ids
-- output paths
-- manifest path or run directory
-- append-only progress events
-- error events with timestamp, item id, error type, and message
-- completion events
-- cancellation events
-
-The registry must not be treated as the source of truth for process liveness.
-Process liveness is runtime state and must be checked directly. Likewise,
-cancel, stop, and resume are runtime controls; they cannot be implemented
-reliably by editing or reading a static registry file alone.
-
-The registry can still record observed liveness checks and management actions
-as append-only events, including unknown state, rate-limit waiting, cancellation
-requests, stop requests, and resume attempts.
-
-The registry should be treated primarily as a debugging and audit artifact.
-Runtime state should come from the worker handle, OS process inspection, and
-current worker status.
+Startup reconciliation handles interrupted runs using durable state plus leases.
+A stale `starting` or `running` run without active ownership becomes `failed`; a
+stale `stopping` run becomes `stopped`; a stale `canceling` run becomes `canceled`.
 
 ### Codex Hooks
 
@@ -546,110 +562,23 @@ The referenced template could materialize to:
 }
 ```
 
-## Agent-Owned Follow-Up
+## Historical Design Notes
 
-The following items are not product questions for the user. They are engineering
-research and design work owned by the implementer before coding starts.
+The original refactor notes below this point were written before implementation
+and are now superseded by the implemented runtime described above. The important
+outcomes were:
 
-### Registry Event Model
-
-Design a JSONL-style append log for debugging and audit only. The log should
-record observations without claiming authority over live state.
-
-Proposed event families:
-
-- `run_started`
-- `item_started`
-- `item_completed`
-- `item_failed`
-- `progress_observed`
-- `liveness_observed`
-- `rate_limit_wait_started`
-- `rate_limit_wait_ended`
-- `stop_requested`
-- `cancel_requested`
-- `resume_requested`
-- `resume_started`
-- `run_stopped`
-- `run_canceled`
-- `run_completed`
-- `run_failed`
-
-Every event should include timestamp, run id, event type, and source. Item
-events should include item id. Liveness events should include the method used to
-observe state and a confidence level, because the registry is recording an
-observation rather than defining the truth.
-
-### Background Worker Architecture
-
-Prefer a child worker process by default.
-
-Reasoning:
-
-- in-process supervised tasks are easy to start but fragile if the MCP server
-  process exits or is restarted
-- detached workers can survive longer but are harder to supervise, cancel, and
-  attribute to a run
-- child worker processes give each background run an inspectable OS process,
-  durable locator data, a control channel, and cleaner failure isolation
-
-The implementation should still allow the MCP server to reattach after restart
-using run-directory locator files.
-
-### Windows Runtime Control
-
-Design Windows worker identity and cancellation around runtime inspection:
-
-- store worker pid, process creation/start token when available, command line
-  marker, run id, and control channel path in the run directory
-- verify a process by pid plus command-line marker or run token, not pid alone
-- use cooperative stop/cancel through the worker control channel first
-- if hard termination is needed, terminate the verified process tree rather than
-  relying on registry state
-- treat missing or unverifiable processes as `unknown` until completed outputs,
-  failure markers, or explicit resume confirms the next state
-
-The exact Windows APIs and Python library choices should be confirmed during
-implementation.
-
-### Codex Desktop Integration
-
-Treat hooks as the supported plugin-side integration surface unless a stronger
-Codex Desktop API is found during implementation.
-
-Current evidence:
-
-- Codex hooks provide interaction-point context injection and continuation
-  support.
-- Codex app-server appears to be a separate client/protocol integration surface,
-  not clearly a plugin API for Windows Desktop background completion triggers.
-- No currently confirmed plugin-side API can start a new assistant response at
-  the exact moment an external background run completes while the session is
-  idle.
-
-Implementation posture:
-
-- use hooks for prompt-time and stop/continuation status injection
-- make `manage_gemini_run` the reliable manual status/progress entry point
-- if a Desktop-supported completion trigger is discovered later, add it as an
-  integration improvement without changing the core run model
-
-### Placeholder Character Set
-
-Keep placeholder names conservative until a real need appears.
-
-Proposed rule:
-
-- allow Unicode letters and numbers
-- allow spaces
-- allow `_-.()[]@+=,~`
-- reject newlines
-- reject `{` and `}`
-- reject Windows-reserved path characters: `< > : " / \ | ? *`
-- reject empty or whitespace-only names
-
-Substituted values may be more flexible than placeholder names, but path fields
-must still validate as absolute paths after substitution.
+- a child worker process was selected for background execution;
+- PID/create-time/token verification and verified process-tree termination were
+  implemented for Windows-compatible control;
+- SQLite WAL replaced the proposed JSONL registry as the authoritative state
+  store, while JSONL remains an audit/debug compatibility export;
+- Codex hook helpers remain optional context-injection aids rather than workers or
+  authorities;
+- placeholder names keep the conservative character rules described in the public
+  request model; and
+- implementation discoveries, deviations, and validation evidence are recorded in
+  `IMPLEMENTATION_LOG.md`.
 
 ## User-Level Decisions Remaining
 

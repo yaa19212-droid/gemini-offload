@@ -13,6 +13,12 @@ short receipt or read guide and is not a serialized copy of `structuredContent`.
 - Auto-saved filenames use a timestamp plus a short UUID.
 - Background runs always write final bodies to durable paths and return only
   run receipts/status paths from the start call.
+- If background `output.path` is omitted, the server creates a managed artifact
+  under `<run_dir>/outputs/` using an index-derived storage key. Caller item IDs
+  remain metadata and never determine managed filenames.
+- An explicit absolute `output.path` remains supported as caller-selected output;
+  it is recorded as unmanaged rather than being confused with the managed
+  `outputs/` namespace.
 
 ## Text Responses
 
@@ -52,6 +58,17 @@ pretty-printed or compact reserialization that might hide whitespace.
 If Gemini returns image parts and `output.path` is set, image files are written
 as siblings next to the text file. The MCP result includes image metadata and
 paths, not image bytes.
+
+## Background Integrity And Resume
+
+The SQLite run store records artifact path, byte count, SHA-256 digest, role, and
+whether the path is managed. A background item marked `completed` is skipped on
+resume only after every recorded artifact passes this integrity check. Missing,
+non-regular, escaped managed paths, size mismatches, or checksum mismatches cause
+that item to become pending and execute again.
+
+`status.json` and `events.jsonl` are compatibility/debug exports. Prefer
+`manage_gemini_run status` and `progress`, which read the committed durable store.
 
 ## Agent Reading Pattern
 

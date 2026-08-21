@@ -5,8 +5,10 @@ agent (Claude Code, Codex, etc.) can offload individual subtasks — OCR,
 speech-to-text, text correction, or any `generate_content` call — without
 bloating its own context.
 
-The server is **stateless**. All batching, splitting, retry policy, and
-result aggregation stay with the client.
+Blocking calls are request-scoped, but **background runs are durable and stateful**.
+The server stores authoritative run/item/event/lease state in a SQLite WAL database
+under the configured run root, while the client remains responsible for high-level
+chunking, validation, and final synthesis.
 
 ## Install
 
@@ -152,6 +154,33 @@ Notes:
   directories outside the OS temp directory.
 - After updating `config.toml`, restart Codex or open a new session so the MCP server list is reloaded.
 
+## Durable background runs
+
+Background execution uses a SQLite WAL database named
+`.gemini-offload-runs.sqlite3` under `GEMINI_OFFLOAD_RUN_DIR` (or the default
+run root). It is the source of truth for run/item state, events, artifact
+integrity metadata, and worker leases. Per-run `status.json` and `events.jsonl`
+files remain compatibility/debug exports and should not be used as authority.
+
+Worker ownership is fenced by a monotonically increasing lease generation plus
+a random token. Heartbeats keep an active lease current; a stale or superseded
+worker cannot commit later state or publish artifacts after losing its fence.
+`manage_gemini_run list/status/progress` reads the durable store and supplements
+that state with verified OS-process liveness where useful.
+
+Automatically managed background outputs live under `<run_dir>/outputs/` and
+use index-derived storage keys rather than caller item IDs. Caller IDs remain
+opaque metadata. An explicit absolute `output.path` is still supported and is
+recorded as caller-managed rather than being confused with a server-managed
+artifact.
+
+A completed background item is skipped on resume only when every recorded
+artifact still exists and matches its recorded byte count and SHA-256 digest.
+Missing, moved, or tampered artifacts are reset for execution and recorded as a
+recovery event. Stale `starting`/`running` runs without a live lease recover to
+`failed`; stale `stopping` and `canceling` states recover to `stopped` and
+`canceled` respectively.
+
 ## Tools
 
 ### `call_gemini`
@@ -255,9 +284,12 @@ Inspect or control background runs.
 
 Actions: `list`, `status`, `progress`, `stop`, `cancel`, `resume`.
 
-Background run directories contain `plan.json`, `status.json`, `events.jsonl`,
-`locator.json`, `control/`, and `outputs/`. The event log is append-only
-debug/audit data; live state is checked from the worker process where possible.
+Background run directories contain `plan.json`, compatibility `status.json` and
+`events.jsonl` exports, `locator.json`, `control/`, and `outputs/`. The configured
+run root also contains the authoritative SQLite store. Prefer
+`manage_gemini_run` over directly interpreting compatibility files: its
+`list/status/progress` actions read committed durable state, while status/control
+responses may additionally inspect the verified worker process.
 
 ### `list_gemini_models`
 
