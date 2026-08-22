@@ -399,3 +399,10 @@ Next checkpoint: continue projection cleanup for call_gemini results, then updat
 - Fixed response-surface document identity: 239 lines, SHA-256 `236E25758CF9408F3F68B7D27DC8F19566901EDD73C455B41B8215CE8C9DCE01`.
 - Original frozen plan remains unchanged at SHA-256 `0EC868FE7D4243683DFA715ECFD41E717411AE6694ABE4993E0E2594E2F4F7D8`.
 - No commit, push, or main-worktree mutation was performed.
+## 2026-08-23 - Response-surface fix committed and pushed
+
+- Committed the completed response-surface fix on `feat/setup-model-registry`.
+- Implementation commit: `393ae89` (`Refine MCP agent response surface`).
+- Pushed successfully to `origin/feat/setup-model-registry`.
+- The push advanced the remote branch from `6b3ce16` to `393ae89`.
+- This checkpoint records the actual successful remote update after the final validation gates.
