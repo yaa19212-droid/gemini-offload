@@ -24,7 +24,8 @@ For personal Windows machines, use a repo-local checkout and run:
 
 The script installs the MCP server in editable mode, checks the expected
 Vertex credential manifest path, and prints the Codex `config.toml` block for
-that machine.
+that machine. It also configures a persistent background-run root at
+`%LOCALAPPDATA%/gemini-offload/runs` by default; pass `-RunDir` to override it.
 
 ## Packaging model
 
@@ -76,6 +77,12 @@ Set `GOOGLE_CLOUD_LOCATION` or `VERTEX_AI_LOCATION` to override the default
 Vertex location (`global`). Rate limits are tracked per Vertex
 project/location/model quota slot and round-robin rotated across configured
 credentials.
+
+Use `check_gemini_setup` for first-run setup, authentication failures, or path
+troubleshooting—not before every request. It performs read-only local validation
+and a bounded OAuth refresh; a successful result does not prove model quota or
+all Vertex API permissions. It never returns private-key, token, or full
+credential-file contents.
 
 ## Run
 
@@ -151,7 +158,15 @@ Notes:
 - Set `GEMINI_OFFLOAD_OUTPUT_DIR` to an absolute path if you want automatic
   large-response spill files outside the OS temp directory.
 - Set `GEMINI_OFFLOAD_RUN_DIR` to an absolute path if you want background run
-  directories outside the OS temp directory.
+  directories outside the OS temp directory. `install-local.ps1` supplies a
+  persistent LocalAppData default; the core server keeps its OS-temp fallback
+  for non-installer/manual setups.
+- The server explicitly sets supported configurable harm-filter categories to
+  `OFF`; this is an internal policy and does not imply that every Vertex or
+  provider-side protection is disabled.
+- When outputs live on another machine, pair gemini-offload with any available
+  filesystem-capable companion to read those paths. No specific companion MCP
+  is a dependency; registered-artifact retrieval remains a future roadmap item.
 - After updating `config.toml`, restart Codex or open a new session so the MCP server list is reloaded.
 
 ## Durable background runs
@@ -202,7 +217,7 @@ Request envelopes use ordered Gemini-style `contents[]`:
     {
       "id": "chunk-01",
       "request": {
-        "model": "gemini-3.1-pro-preview",
+        "model": "gemini-3.7-flash",
         "system": {"path": "D:/work/prompts/ocr.md"},
         "contents": [
           {"role": "user", "parts": [
@@ -293,17 +308,18 @@ responses may additionally inspect the verified worker process.
 
 ### `list_gemini_models`
 
-Returns the supported model list plus `model_characteristics`. No input.
+Returns the supported model list plus `model_characteristics` and compact `model_capabilities`. No input.
 
 Supported models:
 
 | model | role |
 |---|---|
-| `gemini-3.1-pro-preview` | Overall best choice for complex OCR, long-context synthesis, multimodal reasoning, and difficult agentic or coding work. Use it when quality matters more than latency. |
-| `gemini-3-flash-preview` | Emergency fallback when the primary path is unavailable or too slow. It keeps Gemini 3 reasoning and multimodal coverage with Flash latency. |
-| `gemini-3.5-flash` | Fast default for throughput-sensitive jobs. It offers near-Pro agentic and coding capability at Flash speed, and can outperform 3.1 Pro in some narrower workloads. |
+| `gemini-3.7-flash` | Default for normal work. Latest GA Flash and the recommended first choice. |
+| `gemini-3.1-pro-preview` | Quality-first option for especially difficult OCR, long-context synthesis, multimodal reasoning, or complex coding/agentic work. |
+| `gemini-3.6-flash` | 429 rate-limit fallback only; do not prefer it during normal operation. |
+| `gemini-3.5-flash` | Secondary 429 rate-limit fallback only; do not prefer it during normal operation. |
 
-The server intentionally rejects `gemini-2.5*` model IDs and any model not listed above.
+For quota failures, use explicit `rate_limit.fallback_models` in the order `gemini-3.6-flash`, then `gemini-3.5-flash`. The removed `gemini-3-flash-preview` ID is rejected with guidance to use `gemini-3.7-flash`. The server also rejects `gemini-2.5*` model IDs and any model not listed above.
 
 ### `detect_mime`
 

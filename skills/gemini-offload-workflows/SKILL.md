@@ -12,16 +12,24 @@ grounded call, then inspect only receipts, status fields, and targeted files.
 ## Quick Start
 
 1. Use `call_gemini` for the Gemini run.
-2. Use `list_gemini_models` or `detect_mime` only when model choice or file
+2. Use `check_gemini_setup` only for first-run setup, authentication failures,
+   or path troubleshooting; do not call it before every request.
+3. Use `list_gemini_models` or `detect_mime` only when model choice or file
    support is uncertain.
-3. Use `manage_gemini_run` after starting a background run.
-4. Use absolute paths for file, text, schema, template, output, and run paths.
-5. Default to plain text output. Use JSON schema only when exact fields matter.
-6. Use one `call_gemini` item for a bounded artifact, or multiple items with
+4. Use `manage_gemini_run` after starting a background run.
+5. Use absolute paths for file, text, schema, template, output, and run paths.
+6. Default to plain text output. Use JSON schema only when exact fields matter.
+7. Use one `call_gemini` item for a bounded artifact, or multiple items with
    `max_concurrency` for independent artifacts.
-7. Use `execution.lifecycle: "background"` for long OCR/transcription runs.
-8. Treat `structuredContent` as authoritative. `content[0].text` is only a
+8. Use `execution.lifecycle: "background"` for long OCR/transcription runs.
+9. Treat `structuredContent` as authoritative. `content[0].text` is only a
    short receipt or read guide.
+
+Model selection policy:
+- Use `gemini-3.7-flash` by default.
+- Use `gemini-3.1-pro-preview` only when quality matters more than latency.
+- Use `gemini-3.6-flash`, then `gemini-3.5-flash`, only as explicit 429 fallbacks.
+- Do not use the removed `gemini-3-flash-preview` model.
 
 ## Request Model
 
@@ -118,7 +126,7 @@ OCR one chunk, blocking:
   "items": [{
     "id": "chunk-01",
     "request": {
-      "model": "gemini-3.1-pro-preview",
+      "model": "gemini-3.7-flash",
       "system": {"path": "D:/path/to/gemini-offload/prompts/ocr_system.md"},
       "contents": [{"role": "user", "parts": [
         {"file_path": "D:/work/input/chunk-01.pdf"},

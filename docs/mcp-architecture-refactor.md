@@ -14,7 +14,7 @@ promoted to top-level modes.
 - Keep plain text and JSON schema output as first-class choices.
 - Leave `code_execution` as a future design topic, not part of this refactor.
 
-## Implemented Durable Runtime (0.2.0)
+## Implemented Durable Runtime (0.3.0)
 
 The current implementation uses a SQLite WAL database under the configured run
 root as the authoritative background-run store. `runs`, `items`, `artifacts`,
@@ -586,3 +586,28 @@ No remaining item in this document is waiting on the user for investigation.
 Future user decisions should be limited to product-level tradeoffs, such as
 whether the proposed behavior feels right for agent ergonomics, not runtime API
 or platform research.
+
+## Setup, Model Registry, and Runtime Policy
+
+Credential diagnostics are exposed through the read-only `check_gemini_setup`
+tool. It shares manifest resolution with the runtime credential loader, performs
+local manifest/key validation plus a bounded OAuth refresh, and never returns
+private key or token material. A verified result proves credential refresh, not
+model quota or every Vertex permission. On Windows, `install-local.ps1`
+configures `%LOCALAPPDATA%/gemini-offload/runs` as the persistent run root by
+default; the core server retains its OS-temp fallback for manual setups.
+
+Model support is maintainer-curated in `model_registry.py`; runtime model
+metadata never auto-authorizes a newly discovered model. The current selection
+policy is `gemini-3.7-flash` for normal work, `gemini-3.1-pro-preview` as a
+quality-first option, and `gemini-3.6-flash` then `gemini-3.5-flash` only as
+explicit 429 fallbacks. `gemini-3-flash-preview` is removed. Capability
+preflight covers public combinations such as input modality, thinking summary,
+Google Search, JSON schema, and media resolution.
+
+The Gemini client explicitly sets supported configurable harm-filter categories
+to `OFF` as an internal policy; this does not imply that all Vertex/provider
+protections are disabled. Remote artifact reading is intentionally outside this
+MCP's current surface: callers may pair it with any filesystem-capable companion,
+with no specific companion dependency. Registered-artifact retrieval remains a
+roadmap item.

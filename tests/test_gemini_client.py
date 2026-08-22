@@ -13,8 +13,9 @@ from mcp_server.keys import ApiKeyLease, NoAvailableQuotaSlotError
 
 
 EXPECTED_MODELS = [
+    "gemini-3.7-flash",
     "gemini-3.1-pro-preview",
-    "gemini-3-flash-preview",
+    "gemini-3.6-flash",
     "gemini-3.5-flash",
 ]
 
@@ -86,15 +87,19 @@ class GeminiClientTests(unittest.TestCase):
         self.assertNotIn("gemini-3.1-flash-lite-preview", gemini_client.AVAILABLE_MODELS)
         self.assertNotIn("gemini-3.1-flash-image-preview", gemini_client.AVAILABLE_MODELS)
         self.assertNotIn("gemini-3-pro-image-preview", gemini_client.AVAILABLE_MODELS)
+        self.assertNotIn("gemini-3-flash-preview", gemini_client.AVAILABLE_MODELS)
+        self.assertEqual(gemini_client.DEFAULT_MODEL_NAME, "gemini-3.7-flash")
+        self.assertEqual(gemini_client.RATE_LIMIT_FALLBACK_MODELS, ("gemini-3.6-flash", "gemini-3.5-flash"))
 
     def test_model_characteristics_cover_supported_models(self) -> None:
         self.assertEqual(
             sorted(gemini_client.MODEL_CHARACTERISTICS),
             sorted(gemini_client.AVAILABLE_MODELS),
         )
-        self.assertIn("Best overall quality", gemini_client.MODEL_CHARACTERISTICS["gemini-3.1-pro-preview"])
-        self.assertIn("Emergency fallback", gemini_client.MODEL_CHARACTERISTICS["gemini-3-flash-preview"])
-        self.assertIn("Fast default", gemini_client.MODEL_CHARACTERISTICS["gemini-3.5-flash"])
+        self.assertIn("Default model", gemini_client.MODEL_CHARACTERISTICS["gemini-3.7-flash"])
+        self.assertIn("Quality-first option", gemini_client.MODEL_CHARACTERISTICS["gemini-3.1-pro-preview"])
+        self.assertIn("429 rate-limit fallback only", gemini_client.MODEL_CHARACTERISTICS["gemini-3.6-flash"])
+        self.assertIn("Secondary 429 rate-limit fallback only", gemini_client.MODEL_CHARACTERISTICS["gemini-3.5-flash"])
 
     def test_gemini_25_models_are_blocked_before_api_call(self) -> None:
         client = _RecordingClient()
@@ -128,6 +133,18 @@ class GeminiClientTests(unittest.TestCase):
 
         self.assertEqual(client.models.calls, [])
 
+    def test_removed_gemini_3_flash_preview_points_to_current_default(self) -> None:
+        client = _RecordingClient()
+        with self.assertRaisesRegex(ValueError, "Removed Gemini model.*gemini-3.7-flash"):
+            gemini_client._call_api(
+                client=client,
+                model_name="gemini-3-flash-preview",
+                contents_list=[],
+                system_prompt="system",
+                include_thinking=False,
+            )
+        self.assertEqual(client.models.calls, [])
+
     def test_gemini_3_thinking_uses_include_thoughts_config(self) -> None:
         client = _RecordingClient()
 
@@ -143,6 +160,24 @@ class GeminiClientTests(unittest.TestCase):
         self.assertEqual(config.system_instruction, "system")
         self.assertEqual(config.thinking_config.include_thoughts, True)
         self.assertIsNone(config.response_modalities)
+
+    def test_all_supported_models_use_explicit_off_safety_filters(self) -> None:
+        expected_categories = set(gemini_client.DEFAULT_SAFETY_CATEGORIES)
+        for model_name in gemini_client.AVAILABLE_MODELS:
+            with self.subTest(model=model_name):
+                client = _RecordingClient()
+                gemini_client._call_api(
+                    client=client,
+                    model_name=model_name,
+                    contents_list=[],
+                    system_prompt="system",
+                    include_thinking=False,
+                )
+                settings = client.models.calls[0]["config"].safety_settings
+                self.assertEqual({setting.category for setting in settings}, expected_categories)
+                self.assertTrue(
+                    all(setting.threshold == types.HarmBlockThreshold.OFF for setting in settings)
+                )
 
     def test_google_search_uses_grounding_tool_config(self) -> None:
         client = _RecordingClient()
@@ -263,7 +298,7 @@ class GeminiClientTests(unittest.TestCase):
                 ApiKeyLease("key1", "project1", "global", Path("key1.json"), object())
             ),
         ):
-            with patch("mcp_server.gemini_client.get_key_count", return_value=1):
+            with patch("mcp_server.gemini_client.get_vertex_credential_count", return_value=1):
                 with patch("mcp_server.gemini_client.genai.Client", _FakeGenAIClient):
                     result = gemini_client.generate(
                         prompt="draw a cat",
@@ -418,7 +453,7 @@ class GeminiClientTests(unittest.TestCase):
 
         acquired_leases = [_FakeAcquiredLease(lease) for lease in leases]
         with patch("mcp_server.gemini_client.acquire_vertex_credential_lease", side_effect=acquired_leases):
-            with patch("mcp_server.gemini_client.get_key_count", return_value=2):
+            with patch("mcp_server.gemini_client.get_vertex_credential_count", return_value=2):
                 with patch("mcp_server.gemini_client.genai.Client", RateLimitedClient):
                     result = gemini_client.generate(
                         prompt="draw a cat",
@@ -436,7 +471,7 @@ class GeminiClientTests(unittest.TestCase):
         )
 
         with patch("mcp_server.gemini_client.acquire_vertex_credential_lease", side_effect=slot_error):
-            with patch("mcp_server.gemini_client.get_key_count", return_value=1):
+            with patch("mcp_server.gemini_client.get_vertex_credential_count", return_value=1):
                 with self.assertRaises(gemini_client.GeminiRateLimitError) as raised:
                     gemini_client.generate(
                         prompt="hello",
@@ -447,7 +482,7 @@ class GeminiClientTests(unittest.TestCase):
         self.assertEqual(payload["error_type"], "vertex_rate_limited")
         self.assertEqual(payload["model"], "gemini-3.5-flash")
         self.assertEqual(payload["retry_after_seconds"], 12.0)
-        self.assertIn("gemini-3.1-pro-preview", payload["available_fallback_models"])
+        self.assertEqual(payload["available_fallback_models"], ["gemini-3.6-flash"])
 
     def test_generate_uses_explicit_fallback_model_after_rate_limit(self) -> None:
         def acquire_for_model(**kwargs):
@@ -462,7 +497,7 @@ class GeminiClientTests(unittest.TestCase):
             )
 
         with patch("mcp_server.gemini_client.acquire_vertex_credential_lease", side_effect=acquire_for_model):
-            with patch("mcp_server.gemini_client.get_key_count", return_value=1):
+            with patch("mcp_server.gemini_client.get_vertex_credential_count", return_value=1):
                 with patch("mcp_server.gemini_client.genai.Client", _FakeGenAIClient):
                     result = gemini_client.generate(
                         prompt="hello",
@@ -482,7 +517,7 @@ class GeminiClientTests(unittest.TestCase):
             )
 
         with patch("mcp_server.gemini_client.acquire_vertex_credential_lease", side_effect=acquire_for_model):
-            with patch("mcp_server.gemini_client.get_key_count", return_value=1):
+            with patch("mcp_server.gemini_client.get_vertex_credential_count", return_value=1):
                 with patch("mcp_server.gemini_client.genai.Client", _FakeGenAIClient):
                     gemini_client.generate(
                         prompt="hello",
@@ -512,7 +547,7 @@ class GeminiClientTests(unittest.TestCase):
 
         acquired_leases = [_FakeAcquiredLease(lease) for lease in leases]
         with patch("mcp_server.gemini_client.acquire_vertex_credential_lease", side_effect=acquired_leases):
-            with patch("mcp_server.gemini_client.get_key_count", return_value=1):
+            with patch("mcp_server.gemini_client.get_vertex_credential_count", return_value=1):
                 with patch("mcp_server.gemini_client.genai.Client", RateLimitedOnceClient):
                     result = gemini_client.generate(
                         prompt="hello",

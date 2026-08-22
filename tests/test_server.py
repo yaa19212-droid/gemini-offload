@@ -192,12 +192,14 @@ class ServerOutputTests(unittest.TestCase):
         request_schema = call_gemini.inputSchema["properties"]["items"]["items"]["properties"]["request"]
         properties = request_schema["properties"]
 
-        self.assertEqual(properties["model"]["default"], "gemini-3.1-pro-preview")
+        self.assertEqual(properties["model"]["default"], "gemini-3.7-flash")
         self.assertEqual(properties["tools"]["properties"]["google_search"]["default"], False)
         self.assertEqual(properties["rate_limit"]["properties"]["mode"]["default"], "fail_fast")
         self.assertEqual(properties["rate_limit"]["properties"]["mode"]["enum"], ["fail_fast", "wait"])
         self.assertIn("json_schema", properties["output"]["properties"])
         self.assertIn("json_schema_path", properties["output"]["properties"])
+        self.assertNotIn("safety", properties)
+        self.assertNotIn("safety_settings", properties)
         self.assertEqual(
             properties["media_resolution"]["properties"]["image"]["default"],
             "ultra_high",
@@ -1500,9 +1502,21 @@ class ServerOutputTests(unittest.TestCase):
 
         self.assertEqual(
             wrapped.structuredContent["models"],
-            ["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-3.5-flash"],
+            [
+                "gemini-3.7-flash",
+                "gemini-3.1-pro-preview",
+                "gemini-3.6-flash",
+                "gemini-3.5-flash",
+            ],
         )
         self.assertIn("gemini-3.5-flash", wrapped.structuredContent["model_characteristics"])
+        capability = wrapped.structuredContent["model_capabilities"]["gemini-3.5-flash"]
+        self.assertEqual(capability["google_search"], "supported")
+        self.assertEqual(capability["json_schema"], "supported")
+        self.assertIn("high", capability["thinking_levels"])
+        self.assertEqual(capability["vertex_location"], "unverified")
+        self.assertIn("gemini-3.7-flash", wrapped.structuredContent["model_capabilities"])
+        self.assertIn("gemini-3.6-flash", wrapped.structuredContent["model_capabilities"])
 
     def test_plugin_mcp_config_has_no_personal_absolute_paths(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -1519,6 +1533,13 @@ class ServerOutputTests(unittest.TestCase):
         self.assertIn("GEMINI_OFFLOAD_REPO", start_script)
         self.assertIn("GEMINI_OFFLOAD_OUTPUT_DIR", start_script)
         self.assertIn("mcp_server", start_script)
+
+    def test_installer_emits_persistent_run_dir_config(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        installer = (root / "install-local.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn('[string]$RunDir = (Join-Path $env:LOCALAPPDATA "gemini-offload\\runs")', installer)
+        self.assertIn('GEMINI_OFFLOAD_RUN_DIR = ""$runDirConfigPath""', installer)
+        self.assertIn("GetUnresolvedProviderPathFromPSPath($RunDir)", installer)
 
     def test_plugin_workflow_skill_matches_repo_skill(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -1563,7 +1584,7 @@ class ServerOutputTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(package_version, "0.2.0")
+        self.assertEqual(package_version, "0.3.0")
         self.assertEqual(server.SERVER_VERSION, package_version)
         self.assertEqual(plugin["version"], package_version)
 

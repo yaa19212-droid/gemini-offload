@@ -13,20 +13,48 @@ from google import genai
 from google.genai import types
 
 from .keys import (
-    DEFAULT_KEY_COOLDOWN_SECONDS,
-    ApiKeyLease,
+    DEFAULT_VERTEX_CREDENTIAL_COOLDOWN_SECONDS,
+    VertexCredentialLease,
     NoAvailableQuotaSlotError,
     acquire_vertex_credential_lease,
-    get_key_count,
+    get_vertex_credential_count,
+)
+from .model_registry import (
+    AVAILABLE_MODEL_IDS,
+    MODEL_CAPABILITIES,
+    ModelCapability,
+    get_model_capability,
+    model_capabilities_dict,
+    require_supported_capability,
 )
 
 
-DEFAULT_MODEL_NAME = "gemini-3.1-pro-preview"
+DEFAULT_MODEL_NAME = "gemini-3.7-flash"
+RATE_LIMIT_FALLBACK_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash")
+REMOVED_MODELS = {"gemini-3-flash-preview": "gemini-3.7-flash"}
 BLOCKED_MODEL_PREFIXES = ("gemini-2.5",)
 RATE_LIMIT_MODE_FAIL_FAST = "fail_fast"
 RATE_LIMIT_MODE_WAIT = "wait"
 RATE_LIMIT_MODES = {RATE_LIMIT_MODE_FAIL_FAST, RATE_LIMIT_MODE_WAIT}
 DEFAULT_RATE_LIMIT_MAX_WAIT_SECONDS = 120.0
+DEFAULT_SAFETY_CATEGORIES = (
+    types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+    types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+    types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+    types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+)
+
+
+def _default_safety_settings() -> list[types.SafetySetting]:
+    return [
+        types.SafetySetting(
+            category=category,
+            threshold=types.HarmBlockThreshold.OFF,
+        )
+        for category in DEFAULT_SAFETY_CATEGORIES
+    ]
+
+
 MEDIA_RESOLUTION_INPUT_VALUES = ("low", "medium", "high", "ultra_high", "off")
 MEDIA_RESOLUTION_POLICY_KEYS = ("image", "pdf", "video")
 DEFAULT_MEDIA_RESOLUTION_POLICY = {
@@ -42,38 +70,14 @@ MEDIA_RESOLUTION_API_LEVELS = {
 }
 
 
-@dataclass(frozen=True)
-class ModelSpec:
-    supports_thinking: bool = True
-    supports_image_output: bool = False
-    description: str = ""
-
-
-MODEL_SPECS: dict[str, ModelSpec] = {
-    "gemini-3.1-pro-preview": ModelSpec(
-        description=(
-            "Best overall quality for complex OCR, long-context synthesis, "
-            "multimodal reasoning, and difficult agentic or coding work."
-        ),
-    ),
-    "gemini-3-flash-preview": ModelSpec(
-        description=(
-            "Emergency fallback when the primary model is unavailable or too slow; "
-            "keeps Gemini 3 reasoning and multimodal coverage with Flash latency."
-        ),
-    ),
-    "gemini-3.5-flash": ModelSpec(
-        description=(
-            "Fast default for throughput-sensitive jobs; near-Pro agentic and coding "
-            "capability at Flash speed, and better than 3.1 Pro for some workloads."
-        ),
-    ),
-}
-
-AVAILABLE_MODELS = list(MODEL_SPECS)
+# Compatibility exports: the curated registry is the source of truth.
+ModelSpec = ModelCapability
+MODEL_SPECS = MODEL_CAPABILITIES
+AVAILABLE_MODELS = list(AVAILABLE_MODEL_IDS)
 MODEL_CHARACTERISTICS = {
-    model_name: spec.description for model_name, spec in MODEL_SPECS.items()
+    model_name: spec.description for model_name, spec in MODEL_CAPABILITIES.items()
 }
+MODEL_CAPABILITY_MATRIX = model_capabilities_dict()
 
 
 class GeminiRateLimitError(RuntimeError):
@@ -93,7 +97,7 @@ class GeminiRateLimitError(RuntimeError):
         self.quota_slots = quota_slots
         self.available_fallback_models = [
             model_name
-            for model_name in AVAILABLE_MODELS
+            for model_name in RATE_LIMIT_FALLBACK_MODELS
             if model_name not in attempted_models
         ]
         super().__init__(self.message)
@@ -195,6 +199,10 @@ def is_supported_mime(mime_type: str) -> bool:
 
 
 def _assert_allowed_model(model_name: str) -> None:
+    if model_name in REMOVED_MODELS:
+        raise ValueError(
+            f"Removed Gemini model '{model_name}'. Use '{REMOVED_MODELS[model_name]}' instead."
+        )
     if any(model_name.startswith(prefix) for prefix in BLOCKED_MODEL_PREFIXES):
         raise ValueError(
             f"Blocked outdated Gemini model '{model_name}'. "
@@ -202,6 +210,14 @@ def _assert_allowed_model(model_name: str) -> None:
         )
     if model_name not in AVAILABLE_MODELS:
         raise ValueError(f"Unsupported model '{model_name}'. Use list_gemini_models to inspect supported models.")
+
+
+def resolve_model_capability(model_name: Any) -> ModelCapability:
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise ValueError("model must be a non-empty string.")
+    normalized = model_name.strip()
+    _assert_allowed_model(normalized)
+    return get_model_capability(normalized)
 
 
 def _normalize_rate_limit_mode(value: str) -> str:
@@ -223,7 +239,7 @@ def _normalize_rate_limit_max_wait_seconds(value: float | int | None) -> float:
     return float(value)
 
 
-def _normalize_model_sequence(model: str, fallback_models: list[str] | None) -> list[str]:
+def normalize_model_sequence(model: str, fallback_models: list[str] | None) -> list[str]:
     _assert_allowed_model(model)
     sequence = [model]
     if fallback_models is None:
@@ -241,6 +257,10 @@ def _normalize_model_sequence(model: str, fallback_models: list[str] | None) -> 
             seen.add(normalized_model)
             sequence.append(normalized_model)
     return sequence
+
+
+# Compatibility alias for older internal callers.
+_normalize_model_sequence = normalize_model_sequence
 
 
 def normalize_media_resolution_override(value: Any, field_name: str) -> str:
@@ -285,7 +305,89 @@ def _media_resolution_kind(mime_type: str) -> str | None:
     return None
 
 
-def validate_media_resolution_for_mime(mime_type: str, value: Any, field_name: str) -> str:
+def _input_modality_for_mime(mime_type: str) -> str | None:
+    if mime_type.startswith("text/"):
+        return "text"
+    if mime_type.startswith("image/"):
+        return "image"
+    if mime_type.startswith("audio/"):
+        return "audio"
+    if mime_type.startswith("video/"):
+        return "video"
+    if mime_type == "application/pdf":
+        return "pdf"
+    return None
+
+
+def validate_request_capabilities(
+    model_name: str,
+    contents: list[dict[str, Any]],
+    media_resolution_policy: dict[str, str],
+    *,
+    include_thinking: bool = False,
+    google_search: bool = False,
+    response_json_schema: dict[str, Any] | None = None,
+) -> ModelCapability:
+    model = resolve_model_capability(model_name)
+    require_supported_capability(model, "safety_off", model.safety_off)
+    if include_thinking:
+        require_supported_capability(model, "thought_summary", model.supports_thought_summary)
+        if not model.supports_thinking:
+            raise ValueError(f"Model '{model.model_id}' has no supported thinking levels.")
+    if google_search:
+        require_supported_capability(model, "google_search", model.google_search)
+    if response_json_schema is not None:
+        require_supported_capability(model, "json_schema", model.json_schema)
+
+    for content_index, content in enumerate(contents, start=1):
+        if not isinstance(content, dict) or not isinstance(content.get("parts"), list):
+            continue
+        for part_index, part in enumerate(content["parts"], start=1):
+            if not isinstance(part, dict):
+                continue
+            part_name = f"contents[{content_index}].parts[{part_index}]"
+            mime_type: str | None = None
+            if "text" in part or "text_path" in part:
+                modality = "text"
+            elif "file_path" in part:
+                mime_type = detect_mime_type(str(part["file_path"]))
+                modality = _input_modality_for_mime(mime_type)
+            elif "file_uri" in part:
+                raw_mime = part.get("mime_type")
+                mime_type = raw_mime.strip() if isinstance(raw_mime, str) else None
+                modality = _input_modality_for_mime(mime_type) if mime_type else None
+            else:
+                continue
+
+            if modality is None:
+                raise ValueError(f"{part_name} has an unsupported input MIME type: {mime_type}.")
+            if not model.supports_input_modality(modality):
+                raise ValueError(
+                    f"Model '{model.model_id}' does not support input modality '{modality}' for {part_name}."
+                )
+
+            kind = _media_resolution_kind(mime_type) if mime_type else None
+            if kind in MEDIA_RESOLUTION_POLICY_KEYS:
+                raw_level = part.get("media_resolution", media_resolution_policy[kind])
+                level = normalize_media_resolution_override(raw_level, f"{part_name}.media_resolution")
+                if level == "off":
+                    continue
+                require_supported_capability(model, "media_resolution", model.media_resolution.status)
+                if not model.supports_media_resolution(kind, level):
+                    supported = ", ".join(getattr(model.media_resolution, kind, ())) or "none"
+                    raise ValueError(
+                        f"Model '{model.model_id}' does not support {kind} media_resolution '{level}'; "
+                        f"supported levels: {supported}."
+                    )
+    return model
+
+
+def validate_media_resolution_for_mime(
+    mime_type: str,
+    value: Any,
+    field_name: str,
+    model_capability: ModelCapability | None = None,
+) -> str:
     normalized_value = normalize_media_resolution_override(value, field_name)
     kind = _media_resolution_kind(mime_type)
     if kind == "audio":
@@ -293,6 +395,17 @@ def validate_media_resolution_for_mime(mime_type: str, value: Any, field_name: s
     if kind is None:
         raise ValueError(f"{field_name} is only supported for image, PDF, or video parts.")
     _validate_media_resolution_policy_value(kind, normalized_value, field_name)
+    if model_capability is not None and normalized_value != "off":
+        require_supported_capability(
+            model_capability,
+            "media_resolution",
+            model_capability.media_resolution.status,
+        )
+        if not model_capability.supports_media_resolution(kind, normalized_value):
+            raise ValueError(
+                f"Model '{model_capability.model_id}' does not support "
+                f"{field_name}={normalized_value}."
+            )
     return normalized_value
 
 
@@ -638,20 +751,30 @@ def _call_api(
 ):
     """Call Gemini API with the prepared contents."""
 
-    _assert_allowed_model(model_name)
-    model_spec = MODEL_SPECS.get(model_name, ModelSpec())
+    model_spec = resolve_model_capability(model_name)
 
-    config_kwargs = {"system_instruction": system_prompt}
+    require_supported_capability(model_spec, "safety_off", model_spec.safety_off)
+    config_kwargs = {
+        "system_instruction": system_prompt,
+        "safety_settings": _default_safety_settings(),
+    }
     if google_search:
+        require_supported_capability(model_spec, "google_search", model_spec.google_search)
         config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
     if response_json_schema is not None:
         if not isinstance(response_json_schema, dict):
             raise ValueError("response_json_schema must be a JSON object.")
+        require_supported_capability(model_spec, "json_schema", model_spec.json_schema)
         config_kwargs["response_mime_type"] = "application/json"
         config_kwargs["response_json_schema"] = response_json_schema
     if model_spec.supports_image_output:
         config_kwargs["response_modalities"] = ["TEXT", "IMAGE"]
-    if include_thinking and model_spec.supports_thinking:
+    if include_thinking:
+        require_supported_capability(
+            model_spec,
+            "thought_summary",
+            model_spec.supports_thought_summary,
+        )
         config_kwargs["thinking_config"] = types.ThinkingConfig(include_thoughts=True)
 
     config = types.GenerateContentConfig(**config_kwargs)
@@ -710,7 +833,7 @@ def _retry_after_seconds(exc: Exception) -> float:
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None)
     if headers is None:
-        return DEFAULT_KEY_COOLDOWN_SECONDS
+        return DEFAULT_VERTEX_CREDENTIAL_COOLDOWN_SECONDS
 
     retry_after = None
     try:
@@ -719,12 +842,12 @@ def _retry_after_seconds(exc: Exception) -> float:
         retry_after = None
 
     if retry_after is None:
-        return DEFAULT_KEY_COOLDOWN_SECONDS
+        return DEFAULT_VERTEX_CREDENTIAL_COOLDOWN_SECONDS
 
     try:
         return max(float(retry_after), 1.0)
     except ValueError:
-        return DEFAULT_KEY_COOLDOWN_SECONDS
+        return DEFAULT_VERTEX_CREDENTIAL_COOLDOWN_SECONDS
 
 
 def _call_with_retry(operation, max_attempts: int = 2):
@@ -875,7 +998,7 @@ def _generate_with_lease(
     response_json_schema: dict[str, Any] | None,
     media_resolution_policy: dict[str, str] | None,
     normalized_history: list[HistoryTurn],
-    lease: ApiKeyLease,
+    lease: VertexCredentialLease,
 ) -> dict[str, Any]:
     client = genai.Client(
         vertexai=True,
@@ -925,7 +1048,7 @@ def _generate_request_with_lease(
     google_search: bool,
     response_json_schema: dict[str, Any] | None,
     media_resolution_policy: dict[str, str] | None,
-    lease: ApiKeyLease,
+    lease: VertexCredentialLease,
 ) -> dict[str, Any]:
     client = genai.Client(
         vertexai=True,
@@ -984,7 +1107,7 @@ def generate(
     if not isinstance(model, str) or not model.strip():
         raise ValueError("model must be a non-empty string.")
     primary_model = model.strip()
-    model_sequence = _normalize_model_sequence(primary_model, fallback_models)
+    model_sequence = normalize_model_sequence(primary_model, fallback_models)
     normalized_rate_limit_mode = _normalize_rate_limit_mode(rate_limit_mode)
     max_wait_seconds = _normalize_rate_limit_max_wait_seconds(rate_limit_max_wait_seconds)
     if files is not None and not isinstance(files, list):
@@ -1004,6 +1127,25 @@ def generate(
             raise ValueError("files must contain only non-empty string paths.")
         detect_mime(file_path)
 
+    preflight_contents = [
+        {
+            "role": "user",
+            "parts": [
+                {"text": prompt},
+                *({"file_path": file_path} for file_path in requested_files),
+            ],
+        }
+    ]
+    for active_model in model_sequence:
+        validate_request_capabilities(
+            active_model,
+            preflight_contents,
+            normalized_media_resolution_policy,
+            include_thinking=include_thinking,
+            google_search=google_search,
+            response_json_schema=response_json_schema,
+        )
+
     effective_system_prompt = (
         system_prompt.strip()
         if isinstance(system_prompt, str) and system_prompt.strip()
@@ -1012,7 +1154,7 @@ def generate(
 
     attempted_models: list[str] = []
     last_rate_limit: GeminiRateLimitError | None = None
-    max_key_attempts = max(1, get_key_count())
+    max_key_attempts = max(1, get_vertex_credential_count())
     wait_for_cooldown = normalized_rate_limit_mode == RATE_LIMIT_MODE_WAIT
     attempts_per_model = max_key_attempts * (2 if wait_for_cooldown else 1)
 
@@ -1080,7 +1222,7 @@ def generate_request(
     if not isinstance(model, str) or not model.strip():
         raise ValueError("model must be a non-empty string.")
     primary_model = model.strip()
-    model_sequence = _normalize_model_sequence(primary_model, fallback_models)
+    model_sequence = normalize_model_sequence(primary_model, fallback_models)
     normalized_rate_limit_mode = _normalize_rate_limit_mode(rate_limit_mode)
     max_wait_seconds = _normalize_rate_limit_max_wait_seconds(rate_limit_max_wait_seconds)
     if not isinstance(include_thinking, bool):
@@ -1091,6 +1233,15 @@ def generate_request(
         raise ValueError("response_json_schema must be a JSON object.")
     normalized_media_resolution_policy = normalize_media_resolution_policy(media_resolution_policy)
 
+    validate_request_capabilities(
+        primary_model,
+        contents,
+        normalized_media_resolution_policy,
+        include_thinking=include_thinking,
+        google_search=google_search,
+        response_json_schema=response_json_schema,
+    )
+
     effective_system_prompt = (
         system_prompt.strip()
         if isinstance(system_prompt, str) and system_prompt.strip()
@@ -1099,7 +1250,7 @@ def generate_request(
 
     attempted_models: list[str] = []
     last_rate_limit: GeminiRateLimitError | None = None
-    max_key_attempts = max(1, get_key_count())
+    max_key_attempts = max(1, get_vertex_credential_count())
     wait_for_cooldown = normalized_rate_limit_mode == RATE_LIMIT_MODE_WAIT
     attempts_per_model = max_key_attempts * (2 if wait_for_cooldown else 1)
 

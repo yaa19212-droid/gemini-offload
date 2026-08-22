@@ -29,6 +29,7 @@ from .gemini_client import (
     GeminiRateLimitError,
     MEDIA_RESOLUTION_INPUT_VALUES,
     MEDIA_RESOLUTION_POLICY_KEYS,
+    MODEL_CAPABILITY_MATRIX,
     MODEL_CHARACTERISTICS,
     RATE_LIMIT_MODE_FAIL_FAST,
     detect_mime,
@@ -41,6 +42,7 @@ from .artifacts import (
     validate_run_id as _artifact_validate_run_id,
     verify_recorded_artifacts as _verify_recorded_artifacts,
 )
+from .setup_check import check_gemini_setup
 from .output_policy import (
     ENV_OUTPUT_DIR,
     INLINE_OUTPUT_BYTE_LIMIT,
@@ -57,6 +59,7 @@ from .run_service import (
     normalize_run_plan as _service_normalize_run_plan,
 )
 from .run_store import LeaseFenceLost, RunLeaseConflict, RunStore
+from .setup_check import inspect_gemini_setup
 from .worker import (
     inspect_run_liveness as _worker_inspect_run_liveness,
     run_worker_from_dir as _run_worker_runtime,
@@ -67,7 +70,7 @@ from .worker import (
 
 
 SERVER_NAME = "gemini-offload"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 
 
 def _raise_mcp_error(code: int, message: str, data: Any = None) -> None:
@@ -902,6 +905,19 @@ def _tool_definitions() -> list[mcp_types.Tool]:
             },
         ),
         mcp_types.Tool(
+            name="check_gemini_setup",
+            description="Check local Vertex credential setup status.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            outputSchema={
+                "type": "object",
+                "additionalProperties": True,
+            },
+        ),
+        mcp_types.Tool(
             name="list_gemini_models",
             description="List the Gemini models supported by this server with selection guidance.",
             inputSchema={
@@ -919,9 +935,13 @@ def _tool_definitions() -> list[mcp_types.Tool]:
                     "model_characteristics": {
                         "type": "object",
                         "additionalProperties": {"type": "string"},
-                    }
+                    },
+                    "model_capabilities": {
+                        "type": "object",
+                        "additionalProperties": {"type": "object"},
+                    },
                 },
-                "required": ["models", "model_characteristics"],
+                "required": ["models", "model_characteristics", "model_capabilities"],
                 "additionalProperties": False,
             },
         ),
@@ -977,11 +997,16 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None):
         if name == "manage_gemini_run":
             return _wrap_result(_manage_gemini_run(args))
 
+        if name == "check_gemini_setup":
+            result = await anyio.to_thread.run_sync(check_gemini_setup)
+            return _wrap_result(result)
+
         if name == "list_gemini_models":
             return _wrap_result(
                 {
                     "models": AVAILABLE_MODELS,
                     "model_characteristics": MODEL_CHARACTERISTICS,
+                    "model_capabilities": MODEL_CAPABILITY_MATRIX,
                 }
             )
 
