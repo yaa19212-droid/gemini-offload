@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -88,7 +89,7 @@ def _credential_entry(entry: Any, *, index: int, manifest_path: Path) -> dict[st
     if not key_path.is_absolute():
         key_path = manifest_path.parent / key_path
     key_path = key_path.resolve(strict=False)
-    item["key_file"] = key_path.name
+    item["credential_path"] = str(key_path)
     if not key_path.exists():
         item["error"] = f"Credential file not found: {key_path.name}"
         return item
@@ -165,10 +166,22 @@ def inspect_gemini_setup() -> dict[str, Any]:
 
 def _add_roots(result: dict[str, Any]) -> dict[str, Any]:
     configured_run_root = os.environ.get("GEMINI_OFFLOAD_RUN_DIR")
-    result["run_root"] = configured_run_root or "temporary default"
-    result["run_root_temporary"] = configured_run_root is None
-    result["output_root"] = os.environ.get("GEMINI_OFFLOAD_OUTPUT_DIR") or "temporary default"
-    if result.get("ready") and configured_run_root is None:
+    run_root_configured = bool(configured_run_root and configured_run_root.strip())
+    if run_root_configured:
+        run_root = Path(configured_run_root).expanduser()
+    else:
+        run_root = Path(tempfile.gettempdir()) / "gemini-offload" / "runs"
+    result["run_root"] = str(run_root.resolve(strict=False))
+    result["run_root_temporary"] = not run_root_configured
+
+    configured_output_root = os.environ.get("GEMINI_OFFLOAD_OUTPUT_DIR")
+    if configured_output_root and configured_output_root.strip():
+        output_root = Path(configured_output_root).expanduser()
+    else:
+        output_root = Path(tempfile.gettempdir()) / "gemini-offload" / "outputs"
+    result["output_root"] = str(output_root.resolve(strict=False))
+
+    if result.get("ready") and not run_root_configured:
         result["next_action"] = (
             "Gemini offload is ready; configure GEMINI_OFFLOAD_RUN_DIR for durable background runs."
         )

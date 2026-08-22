@@ -308,7 +308,7 @@ responses may additionally inspect the verified worker process.
 
 ### `list_gemini_models`
 
-Returns the supported model list plus `model_characteristics` and compact `model_capabilities`. No input.
+Returns one ordered `models` collection derived from the curated registry. Each entry includes the model ID, role/stage, concise guidance, and agent-relevant capabilities. No input.
 
 Supported models:
 

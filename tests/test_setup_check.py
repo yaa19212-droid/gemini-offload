@@ -216,7 +216,14 @@ class SetupCheckTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             result = setup_check._add_roots({"ready": True, "next_action": "Gemini offload is ready."})
         self.assertTrue(result["run_root_temporary"])
-        self.assertEqual(result["run_root"], "temporary default")
+        self.assertEqual(
+            Path(result["run_root"]),
+            (Path(tempfile.gettempdir()) / "gemini-offload" / "runs").resolve(),
+        )
+        self.assertEqual(
+            Path(result["output_root"]),
+            (Path(tempfile.gettempdir()) / "gemini-offload" / "outputs").resolve(),
+        )
         self.assertIn("GEMINI_OFFLOAD_RUN_DIR", result["next_action"])
 
 

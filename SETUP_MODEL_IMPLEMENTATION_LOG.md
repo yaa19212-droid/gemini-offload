@@ -296,3 +296,106 @@ Phase 4 registry foundation is now complete. Remaining work follows the frozen p
 - Final isolated PEP 517 wheel build succeeds as `gemini_offload_mcp-0.3.0-py3-none-any.whl` with SHA-256 `CCCC6F82B8918549FE68EE056038424E3C45125F88397C3FBA9BA6C966D3647A`.
 - Frozen plan remains unchanged at SHA-256 `0EC868FE7D4243683DFA715ECFD41E717411AE6694ABE4993E0E2594E2F4F7D8`.
 - Release candidate is ready for feature-branch commit and push; no main-worktree mutation has been performed.
+
+## 2026-08-23 - Agent response surface review and fixed design decision
+
+- Added new fixed design document: `SETUP_MODEL_RESPONSE_SURFACE_FIX.md`.
+- Existing append-only log is continued rather than creating a separate log because
+  this is a follow-up design correction within the same setup/model update.
+- Reviewed implementation and contract tests for `server.py`, `setup_check.py`,
+  `model_registry.py`, `output_policy.py`, `run_service.py`, and related tests.
+
+### Main findings
+
+- Internal structures and MCP response structures were incorrectly sharing some
+  representation details. Rich internal registries remain useful, but MCP output
+  should use explicit agent-facing projections.
+- Legacy response compatibility was preserved too aggressively in places where no
+  durable consumer or migration requirement existed.
+- `list_gemini_models` exposed three overlapping model identity structures:
+  `models`, `model_characteristics`, and `model_capabilities`.
+- `check_gemini_setup` exposed fields that duplicated other returned facts or
+  emitted non-actionable success messages.
+- `call_gemini` exposed internal run abstraction details and raw SDK usage shape
+  that were not consistently useful to an agent.
+
+### Fixed response-surface direction
+
+- Add projection boundaries between internal runtime/registry objects and MCP
+  structuredContent.
+- Remove duplicate fields rather than preserving aliases by default.
+- Preserve detailed diagnostic information only when it enables recovery,
+  selection, or retrieval actions.
+- Keep internal safety policy and runtime diagnostics separate from public
+  configurable capability surfaces.
+- Normalize SDK usage metadata before exposure.
+- Keep durable background-run handles, but do not expose fake durability for
+  blocking runs.
+
+### Frozen fix scope
+
+The new fix document supersedes earlier compatibility assumptions only for
+agent-facing response serialization. It does not alter request compatibility,
+credential formats, runtime behavior, or durable background storage semantics.
+
+## 2026-08-23 - Response surface fix implementation started
+
+- Added frozen follow-up design document `SETUP_MODEL_RESPONSE_SURFACE_FIX.md`.
+- Decision: keep implementation history in this append-only log rather than creating a second log because this work is a continuation of the setup/model update.
+- Added initial `mcp_server/response_projection.py` boundary for agent-facing structured responses.
+- Implemented initial public projections:
+  - normalized usage projection;
+  - single registry-derived model discovery projection;
+  - setup diagnostic cleanup projection.
+- Updated MCP server routing so `check_gemini_setup` and `list_gemini_models` use projections instead of exposing internal compatibility structures directly.
+- Preserved internal registries and runtime structures unchanged.
+- Initial compile validation: `python -m compileall mcp_server` passed.
+- System Python in the current shell does not contain pytest (`No module named pytest`); full regression validation requires the repository validation environment used by previous checkpoints.
+
+Next checkpoint: continue projection cleanup for call_gemini results, then update contract tests to assert useful agent-facing information rather than legacy response fields.
+
+## 2026-08-23 - Response surface fix implementation started
+
+- Added `SETUP_MODEL_RESPONSE_SURFACE_FIX.md` as a fixed follow-up design document.
+- Kept `SETUP_MODEL_IMPLEMENTATION_LOG.md` as the append-only history source; no new log file was created.
+- Added `mcp_server/response_projection.py` as an explicit boundary between internal runtime structures and MCP `structuredContent`.
+- Connected setup/model/run responses through projection helpers.
+- `list_gemini_models` no longer returns the legacy parallel `models` + `model_characteristics` + `model_capabilities` projection; it now emits one registry-derived model collection.
+- `check_gemini_setup` public projection removes internal-equivalent fields such as `ready` and credential array indexes, while retaining recovery-oriented diagnostic data.
+- Added initial `call_gemini` projections: blocking responses no longer expose internal run identifiers or unnecessary aggregate metadata; item results normalize usage metadata.
+- Background run receipts retain real control handles while removing non-actionable worker implementation details.
+- Compile validation passes after initial projection changes.
+- Direct pytest invocation with system Python failed because the active shell Python environment does not contain pytest; reuse the repository validation environment before final regression validation.
+
+## 2026-08-23 - Response projection refinement checkpoint
+
+- Extended `response_projection.py` with blocking/background run projections and per-item result cleanup.
+- Blocking `call_gemini` responses now remove internal run identifiers, execution lifecycle echoes, single-item aggregate counters, and non-actionable timing metadata.
+- Usage data is normalized at the MCP boundary instead of exposing raw Google SDK metadata.
+- Background start responses keep actual control handles (`run_id`, `run_dir`, status/event locations) while dropping worker implementation details such as PID.
+- Updated setup projection to hide equivalent `ready` state, success-only `next_action`, credential indexes, and duplicate credential filename metadata.
+- Updated model discovery contract test to assert the single registry-derived model collection and absence of legacy parallel capability projections.
+- Updated MCP runtime setup test for the new agent-facing setup surface.
+- Remaining validation requires the repository Python environment containing pytest; the system Python installation does not provide pytest.
+
+## 2026-08-23 - Agent response surface fix implementation complete
+
+- Implemented the fixed design in `SETUP_MODEL_RESPONSE_SURFACE_FIX.md`.
+- Added `mcp_server/response_projection.py` as the explicit boundary between rich internal runtime/registry state and MCP `structuredContent`.
+- `list_gemini_models` now returns one ordered registry-derived `models` collection; legacy `model_characteristics` and `model_capabilities` projections are removed from both the handler result and MCP output schema.
+- Public model entries retain selection/stage and request-relevant capabilities while omitting internal safety/location evidence flags. Redundant fallback prose is omitted; default/quality guidance remains.
+- `check_gemini_setup` public results remove equivalent `ready`, aggregate credential count, and credential array indices. Credential entries expose resolved diagnostic paths without secret material.
+- Setup root diagnostics now return actual resolved run/output paths, including the concrete temporary defaults, while `run_root_temporary` preserves the durability distinction.
+- Success-only `Gemini offload is ready.` guidance is suppressed; actionable remediation/durable-run guidance remains.
+- Blocking `call_gemini` results no longer expose non-durable run IDs, lifecycle echoes, concurrency echoes, success-count duplication, item indices, elapsed timing, or inline-only output size metadata.
+- Multi-item blocking runs retain `item_count` plus `error_count` as useful summary information; manifest-compacted runs preserve `item_count` even when inline `results` is empty.
+- Background start receipts retain real control/retrieval handles (`run_id`, `run_dir`, status/events/locator paths and guidance) while omitting non-actionable lifecycle, plan path, concurrency, and PID fields.
+- Raw Google SDK usage metadata is normalized to stable `input_tokens`, `output_tokens`, `thinking_tokens`, and `total_tokens` fields; nullable SDK/detail noise is not exposed.
+- Added `tests/test_response_projection.py` and updated server/runtime/setup contract tests for the new surface, including output-schema regressions.
+- Updated README model-discovery documentation to describe the single ordered model collection.
+- Validation: full suite passes 127/127 tests plus 22 subtests; `compileall`, Ruff fatal selectors (`E9,F63,F7,F82`), Bandit medium/high scan, and `git diff --check` all pass.
+- Real MCP 2.0 non-inference smoke confirms `list_gemini_models` wire keys are only `models`, legacy model fields are absent, setup public output omits `ready`, and default run/output roots are absolute resolved paths.
+- Root and bundled workflow skills remain byte-identical.
+- Fixed response-surface document identity: 239 lines, SHA-256 `236E25758CF9408F3F68B7D27DC8F19566901EDD73C455B41B8215CE8C9DCE01`.
+- Original frozen plan remains unchanged at SHA-256 `0EC868FE7D4243683DFA715ECFD41E717411AE6694ABE4993E0E2594E2F4F7D8`.
+- No commit, push, or main-worktree mutation was performed.

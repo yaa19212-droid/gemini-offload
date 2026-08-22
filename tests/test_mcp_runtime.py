@@ -56,7 +56,7 @@ class McpRuntimeCompatibilityTests(unittest.TestCase):
 
         wire = result.model_dump(by_alias=True)
         self.assertFalse(wire["isError"])
-        self.assertFalse(wire["structuredContent"]["ready"])
+        self.assertNotIn("ready", wire["structuredContent"])
         self.assertEqual(wire["structuredContent"]["status"], "invalid")
         self.assertTrue(wire["structuredContent"]["next_action"])
 

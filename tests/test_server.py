@@ -733,7 +733,8 @@ class ServerOutputTests(unittest.TestCase):
             data = wrapped.structuredContent
             run_dir = Path(data["run_dir"])
 
-            self.assertEqual(data["lifecycle"], "background")
+            self.assertNotIn("lifecycle", data)
+            self.assertIn("run_id", data)
             self.assertEqual(data["status"], "starting")
             self.assertTrue((run_dir / "plan.json").exists())
             self.assertTrue((run_dir / "status.json").exists())
@@ -1100,7 +1101,8 @@ class ServerOutputTests(unittest.TestCase):
 
         self.assertLess(elapsed, 0.35)
         self.assertEqual(wrapped.structuredContent["item_count"], 2)
-        self.assertEqual(wrapped.structuredContent["ok_count"], 2)
+        self.assertEqual(wrapped.structuredContent["error_count"], 0)
+        self.assertNotIn("ok_count", wrapped.structuredContent)
         self.assertEqual([item["id"] for item in wrapped.structuredContent["results"]], ["a", "b"])
         self.assertEqual(wrapped.content[0].text, "Gemini run returned in structuredContent.")
         self.assertNotIn('"results"', wrapped.content[0].text)
@@ -1136,12 +1138,13 @@ class ServerOutputTests(unittest.TestCase):
 
             data = wrapped.structuredContent
             self.assertTrue(data["results_compacted"])
-            self.assertGreater(data["aggregate_byte_count"], data["aggregate_inline_limit"])
+            self.assertGreater(data["aggregate_byte_count"], server.BATCH_AGGREGATE_BYTE_LIMIT)
             self.assertLessEqual(
                 server._structured_content_byte_count(data),
-                data["aggregate_inline_limit"],
+                server.BATCH_AGGREGATE_BYTE_LIMIT,
             )
-            self.assertEqual(data["ok_count"], 5)
+            self.assertNotIn("aggregate_inline_limit", data)
+            self.assertNotIn("ok_count", data)
             self.assertEqual(len(data["results"]), 5)
             self.assertIn("Successful item outputs were saved", data["read_guidance"])
             self.assertEqual(
@@ -1234,10 +1237,12 @@ class ServerOutputTests(unittest.TestCase):
             self.assertTrue(data["results_compacted"])
             self.assertTrue(data["results_omitted"])
             self.assertEqual(data["results"], [])
-            self.assertEqual(data["omitted_result_count"], 30)
+            self.assertEqual(data["item_count"], 30)
+            self.assertNotIn("omitted_result_count", data)
+            self.assertNotIn("aggregate_inline_limit", data)
             self.assertLessEqual(
                 server._structured_content_byte_count(data),
-                data["aggregate_inline_limit"],
+                server.BATCH_AGGREGATE_BYTE_LIMIT,
             )
             results_path = Path(data["results_path"])
             self.assertEqual(results_path.parent, Path(temp_dir).resolve())
@@ -1373,8 +1378,9 @@ class ServerOutputTests(unittest.TestCase):
                 wrapped = anyio.run(run_call)
 
             data = wrapped.structuredContent
-            self.assertEqual(data["ok_count"], 4)
+            self.assertEqual(data["item_count"], 5)
             self.assertEqual(data["error_count"], 1)
+            self.assertNotIn("ok_count", data)
             error_result = next(result for result in data["results"] if result["ok"] is False)
             self.assertEqual(error_result["id"], "bad")
             self.assertEqual(error_result["error_type"], "vertex_rate_limited")
@@ -1490,18 +1496,24 @@ class ServerOutputTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["id"], "a")
         self.assertEqual(result["error_type"], "vertex_rate_limited")
-        self.assertEqual(wrapped.structuredContent["error_count"], 1)
+        self.assertNotIn("error_count", wrapped.structuredContent)
 
-    def test_list_gemini_models_includes_characteristics(self) -> None:
+    def test_list_gemini_models_returns_registry_projection(self) -> None:
         server = _load_server_module()
+        tool = next(item for item in server._tool_definitions() if item.name == "list_gemini_models")
+        self.assertEqual(tool.outputSchema["required"], ["models"])
+        self.assertEqual(tool.outputSchema["properties"]["models"]["items"]["type"], "object")
+        self.assertNotIn("model_characteristics", tool.outputSchema["properties"])
+        self.assertNotIn("model_capabilities", tool.outputSchema["properties"])
 
         async def run_list_models():
             return await server.handle_call_tool("list_gemini_models", {})
 
         wrapped = anyio.run(run_list_models)
+        models = wrapped.structuredContent["models"]
 
         self.assertEqual(
-            wrapped.structuredContent["models"],
+            [item["id"] for item in models],
             [
                 "gemini-3.7-flash",
                 "gemini-3.1-pro-preview",
@@ -1509,14 +1521,14 @@ class ServerOutputTests(unittest.TestCase):
                 "gemini-3.5-flash",
             ],
         )
-        self.assertIn("gemini-3.5-flash", wrapped.structuredContent["model_characteristics"])
-        capability = wrapped.structuredContent["model_capabilities"]["gemini-3.5-flash"]
+        self.assertNotIn("model_characteristics", wrapped.structuredContent)
+        self.assertNotIn("model_capabilities", wrapped.structuredContent)
+        capability = next(item for item in models if item["id"] == "gemini-3.5-flash")
         self.assertEqual(capability["google_search"], "supported")
         self.assertEqual(capability["json_schema"], "supported")
         self.assertIn("high", capability["thinking_levels"])
-        self.assertEqual(capability["vertex_location"], "unverified")
-        self.assertIn("gemini-3.7-flash", wrapped.structuredContent["model_capabilities"])
-        self.assertIn("gemini-3.6-flash", wrapped.structuredContent["model_capabilities"])
+        self.assertNotIn("safety_off", capability)
+        self.assertNotIn("guidance", capability)
 
     def test_plugin_mcp_config_has_no_personal_absolute_paths(self) -> None:
         root = Path(__file__).resolve().parents[1]
