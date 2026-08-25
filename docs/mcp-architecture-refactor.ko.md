@@ -15,7 +15,7 @@
 - `code_execution`은 미래 설계 주제로만 남기고, 이번 리팩터링에서는
   제외한다.
 
-## 구현된 Durable Runtime (0.2.0)
+## 구현된 Durable Runtime (0.3.0)
 
 현재 background runtime의 authoritative state는 run root 아래의 SQLite WAL
 데이터베이스다. `runs`, `items`, `artifacts`, `events`, `worker_leases`를
@@ -578,3 +578,27 @@ referenced template은 다음과 같은 request envelope로 materialize될 수 �
 - 구현 과정의 세부 발견, 타협, 검증 결과는 `IMPLEMENTATION_LOG.md`에 기록한다.
 
 이 문서에서 사용자의 추가 조사를 기다리는 runtime 설계 질문은 없다.
+
+## Setup, Model Registry, Runtime 정책
+
+credential 진단은 read-only `check_gemini_setup` tool로 제공한다. runtime
+credential loader와 같은 manifest resolution을 사용하며, local manifest/key
+검증과 제한된 OAuth refresh를 수행한다. private key나 token은 반환하지 않는다.
+`verified`는 credential refresh 성공을 뜻하며 model quota나 모든 Vertex 권한을
+보장하지 않는다. Windows `install-local.ps1`은 기본적으로
+`%LOCALAPPDATA%/gemini-offload/runs`를 persistent run root로 설정하고, core
+server는 수동 설정 사용자를 위해 OS temp fallback을 유지한다.
+
+지원 model은 `model_registry.py`에서 maintainer가 명시적으로 관리한다. runtime
+metadata에서 새 model을 발견해도 자동으로 허용하지 않는다. 현재 정책은 일반
+작업에 `gemini-3.7-flash`, 품질 우선 작업에 `gemini-3.1-pro-preview`, 429
+fallback에만 `gemini-3.6-flash` 다음 `gemini-3.5-flash`를 사용한다.
+`gemini-3-flash-preview`는 제거했다. input modality, thought summary, Google
+Search, JSON schema, media resolution 같은 공개 조합은 API 호출 전에 capability
+preflight로 검증한다.
+
+Gemini client는 조정 가능한 supported harm-filter category를 내부 정책으로
+명시적 `OFF` 설정한다. 이것이 모든 Vertex/provider 보호 기능이 꺼졌다는 뜻은
+아니다. remote artifact 읽기는 현재 MCP surface 밖에 있으며, caller는 필요할
+때 어떤 filesystem-capable companion과도 조합할 수 있다. 특정 companion MCP는
+의존성이 아니고 registered-artifact retrieval은 roadmap으로 남긴다.

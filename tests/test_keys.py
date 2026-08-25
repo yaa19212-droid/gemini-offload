@@ -10,10 +10,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mcp_server.keys import (
+    ApiKeyLease,
+    ApiKeyRotator,
     NoAvailableQuotaSlotError,
     VertexCredentialLease,
     VertexCredentialRotator,
     _resolve_vertex_manifest,
+    get_key_count,
+    get_quota_slot_count,
+    get_vertex_credential_count,
+    get_vertex_quota_slot_count,
+    resolve_vertex_manifest_info,
 )
 
 
@@ -31,6 +38,35 @@ class VertexCredentialTests(unittest.TestCase):
                     os.environ.pop("GEMINI_OFFLOAD_VERTEX_CREDENTIALS", None)
                 else:
                     os.environ["GEMINI_OFFLOAD_VERTEX_CREDENTIALS"] = old_env
+
+
+    def test_manifest_info_preserves_environment_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            primary = root / "primary.json"
+            shared = root / "shared.json"
+            env = {
+                "GEMINI_OFFLOAD_VERTEX_CREDENTIALS": str(primary),
+                "VERTEX_AI_CREDENTIALS": str(shared),
+            }
+            with patch.dict(os.environ, env, clear=True):
+                source, path = resolve_vertex_manifest_info()
+            self.assertEqual(source, "GEMINI_OFFLOAD_VERTEX_CREDENTIALS")
+            self.assertEqual(path, primary)
+
+    def test_canonical_credential_names_match_compatibility_aliases(self) -> None:
+        credentials = [
+            VertexCredentialLease("a", "project-a", "global", Path("a.json"), object()),
+            VertexCredentialLease("b", "project-b", "global", Path("b.json"), object()),
+        ]
+        rotator = VertexCredentialRotator(credentials)
+        with patch("mcp_server.keys.get_vertex_credential_rotator", return_value=rotator):
+            self.assertEqual(get_vertex_credential_count(), 2)
+            self.assertEqual(get_key_count(), 2)
+            self.assertEqual(get_vertex_quota_slot_count("gemini-test"), 2)
+            self.assertEqual(get_quota_slot_count("gemini-test"), 2)
+        self.assertIs(ApiKeyLease, VertexCredentialLease)
+        self.assertIs(ApiKeyRotator, VertexCredentialRotator)
 
     def test_rotator_skips_credential_on_cooldown(self) -> None:
         credentials = [

@@ -33,7 +33,9 @@ _rotator_lock = threading.Lock()
 _rotator: "VertexCredentialRotator | None" = None
 
 
-DEFAULT_KEY_COOLDOWN_SECONDS = 60.0
+DEFAULT_VERTEX_CREDENTIAL_COOLDOWN_SECONDS = 60.0
+# Compatibility alias for existing callers.
+DEFAULT_KEY_COOLDOWN_SECONDS = DEFAULT_VERTEX_CREDENTIAL_COOLDOWN_SECONDS
 DEFAULT_SLOT_CONCURRENCY = 1
 
 
@@ -89,7 +91,7 @@ class AcquiredVertexCredentialLease:
     def __exit__(self, exc_type, exc, traceback) -> None:
         self.release()
 
-    def mark_cooldown(self, seconds: float = DEFAULT_KEY_COOLDOWN_SECONDS) -> None:
+    def mark_cooldown(self, seconds: float = DEFAULT_VERTEX_CREDENTIAL_COOLDOWN_SECONDS) -> None:
         self._rotator.mark_quota_slot_cooldown(self.quota_slot, seconds)
 
     def release(self) -> None:
@@ -198,8 +200,12 @@ class VertexCredentialRotator:
 
                 self._condition.wait(timeout=min(retry_after_seconds, remaining_wait))
 
-    def key_count(self) -> int:
+    def credential_count(self) -> int:
         return len(self._ordered_credentials)
+
+    def key_count(self) -> int:
+        """Compatibility alias for credential_count()."""
+        return self.credential_count()
 
     def quota_slot_count(self, model: str) -> int:
         return len(self.quota_slots(model))
@@ -212,24 +218,32 @@ class VertexCredentialRotator:
             }
         )
 
+    def mark_credential_cooldown(
+        self,
+        credential_name: str,
+        seconds: float = DEFAULT_VERTEX_CREDENTIAL_COOLDOWN_SECONDS,
+    ) -> None:
+        if not credential_name:
+            return
+        with self._condition:
+            self._legacy_credential_cooldowns[credential_name] = max(
+                self._legacy_credential_cooldowns.get(credential_name, 0.0),
+                time.monotonic() + max(seconds, 0.0),
+            )
+            self._condition.notify_all()
+
     def mark_key_cooldown(
         self,
         key_name: str,
         seconds: float = DEFAULT_KEY_COOLDOWN_SECONDS,
     ) -> None:
-        if not key_name:
-            return
-        with self._condition:
-            self._legacy_credential_cooldowns[key_name] = max(
-                self._legacy_credential_cooldowns.get(key_name, 0.0),
-                time.monotonic() + max(seconds, 0.0),
-            )
-            self._condition.notify_all()
+        """Compatibility alias for mark_credential_cooldown()."""
+        self.mark_credential_cooldown(key_name, seconds)
 
     def mark_quota_slot_cooldown(
         self,
         quota_slot: str,
-        seconds: float = DEFAULT_KEY_COOLDOWN_SECONDS,
+        seconds: float = DEFAULT_VERTEX_CREDENTIAL_COOLDOWN_SECONDS,
     ) -> None:
         if not quota_slot:
             return
@@ -309,22 +323,24 @@ def _resolve_vertex_location() -> str:
     return DEFAULT_VERTEX_LOCATION
 
 
-def _resolve_vertex_manifest() -> Path:
+def resolve_vertex_manifest_info() -> tuple[str, Path]:
+    """Resolve the Vertex credential manifest without loading credentials."""
+
     for name in (ENV_VERTEX_CREDENTIALS, ENV_SHARED_VERTEX_CREDENTIALS):
         value = os.environ.get(name)
         if value and value.strip():
-            path = Path(value).expanduser()
-            if not path.exists():
-                raise FileNotFoundError(f"{name} points to missing file: {path}")
-            return path
+            return name, Path(value).expanduser()
 
-    if DEFAULT_VERTEX_MANIFEST.exists():
-        return DEFAULT_VERTEX_MANIFEST
+    return "default", DEFAULT_VERTEX_MANIFEST
 
-    raise FileNotFoundError(
-        "No Vertex AI credential manifest found. Provide "
-        f"${ENV_VERTEX_CREDENTIALS}=<manifest.json> or ${ENV_SHARED_VERTEX_CREDENTIALS}=<manifest.json>."
-    )
+
+def _resolve_vertex_manifest() -> Path:
+    source, path = resolve_vertex_manifest_info()
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{source} points to missing Vertex credential manifest: {path}"
+        )
+    return path
 
 
 def _load_manifest_entries(path: Path) -> list[dict[str, Any]]:
@@ -384,7 +400,7 @@ def load_vertex_credentials() -> list[VertexCredentialLease]:
     return credentials
 
 
-def get_key_rotator() -> VertexCredentialRotator:
+def get_vertex_credential_rotator() -> VertexCredentialRotator:
     """Return the shared Vertex credential rotator for this process."""
 
     global _rotator
@@ -394,10 +410,18 @@ def get_key_rotator() -> VertexCredentialRotator:
         return _rotator
 
 
-def get_next_api_key_lease() -> VertexCredentialLease:
-    """Compatibility name: return the next Vertex credential lease."""
+# Compatibility alias: prefer get_vertex_credential_rotator in new code.
+def get_key_rotator() -> VertexCredentialRotator:
+    return get_vertex_credential_rotator()
 
-    return get_key_rotator().next_lease()
+
+def get_next_vertex_credential_lease() -> VertexCredentialLease:
+    return get_vertex_credential_rotator().next_lease()
+
+
+# Compatibility alias: prefer get_next_vertex_credential_lease.
+def get_next_api_key_lease() -> VertexCredentialLease:
+    return get_next_vertex_credential_lease()
 
 
 def acquire_vertex_credential_lease(
@@ -408,37 +432,53 @@ def acquire_vertex_credential_lease(
 ) -> AcquiredVertexCredentialLease:
     """Acquire a Vertex credential for one project/location/model quota slot."""
 
-    return get_key_rotator().acquire_lease(
+    return get_vertex_credential_rotator().acquire_lease(
         model=model,
         wait_for_cooldown=wait_for_cooldown,
         max_wait_seconds=max_wait_seconds,
     )
 
 
+def mark_vertex_credential_cooldown(
+    credential_name: str,
+    seconds: float = DEFAULT_VERTEX_CREDENTIAL_COOLDOWN_SECONDS,
+) -> None:
+    get_vertex_credential_rotator().mark_credential_cooldown(credential_name, seconds)
+
+
 def mark_key_cooldown(
     key_name: str,
     seconds: float = DEFAULT_KEY_COOLDOWN_SECONDS,
 ) -> None:
-    """Compatibility name: temporarily avoid a credential."""
-
-    get_key_rotator().mark_key_cooldown(key_name, seconds)
+    """Compatibility alias for mark_vertex_credential_cooldown()."""
+    mark_vertex_credential_cooldown(key_name, seconds)
 
 
 def mark_quota_slot_cooldown(
     quota_slot: str,
-    seconds: float = DEFAULT_KEY_COOLDOWN_SECONDS,
+    seconds: float = DEFAULT_VERTEX_CREDENTIAL_COOLDOWN_SECONDS,
 ) -> None:
     """Temporarily avoid a Vertex project/location/model quota slot."""
 
-    get_key_rotator().mark_quota_slot_cooldown(quota_slot, seconds)
+    get_vertex_credential_rotator().mark_quota_slot_cooldown(quota_slot, seconds)
 
 
+def get_vertex_credential_count() -> int:
+    return get_vertex_credential_rotator().credential_count()
+
+
+# Compatibility alias: prefer get_vertex_credential_count.
 def get_key_count() -> int:
-    return get_key_rotator().key_count()
+    return get_vertex_credential_count()
 
 
+def get_vertex_quota_slot_count(model: str) -> int:
+    return get_vertex_credential_rotator().quota_slot_count(model)
+
+
+# Compatibility alias: prefer get_vertex_quota_slot_count.
 def get_quota_slot_count(model: str) -> int:
-    return get_key_rotator().quota_slot_count(model)
+    return get_vertex_quota_slot_count(model)
 
 
 # Backwards-compatible aliases for older tests and imports.

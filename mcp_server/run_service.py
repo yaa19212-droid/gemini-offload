@@ -23,7 +23,7 @@ from .gemini_client import (
     normalize_media_resolution_policy,
     validate_media_resolution_for_mime,
 )
-from .keys import get_key_count
+from .keys import get_vertex_credential_count
 from .run_store import LeaseFenceLost, RunLeaseConflict, RunStore
 
 
@@ -745,7 +745,7 @@ def load_json_schema(inline: Any, path: Any) -> Any:
 
 def _normalize_batch_concurrency(value: Any) -> int:
     if value is None:
-        return min(max(get_key_count(), 1), MAX_BATCH_CONCURRENCY)
+        return min(max(get_vertex_credential_count(), 1), MAX_BATCH_CONCURRENCY)
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError("max_concurrency must be an integer.")
     if value < 1:

@@ -22,14 +22,12 @@ except ImportError:  # mcp >= 2.0 renamed the exception and changed its construc
     _MCP_ERROR_USES_ERROR_DATA = False
 
 from .gemini_client import (
-    AVAILABLE_MODELS,
     DEFAULT_MODEL_NAME,
     DEFAULT_MEDIA_RESOLUTION_POLICY,
     DEFAULT_RATE_LIMIT_MAX_WAIT_SECONDS,
     GeminiRateLimitError,
     MEDIA_RESOLUTION_INPUT_VALUES,
     MEDIA_RESOLUTION_POLICY_KEYS,
-    MODEL_CHARACTERISTICS,
     RATE_LIMIT_MODE_FAIL_FAST,
     detect_mime,
     generate_request,
@@ -40,6 +38,13 @@ from .artifacts import (
     validate_managed_run_dir as _artifact_validate_managed_run_dir,
     validate_run_id as _artifact_validate_run_id,
     verify_recorded_artifacts as _verify_recorded_artifacts,
+)
+from .setup_check import check_gemini_setup
+from .response_projection import (
+    project_background_start,
+    project_blocking_run,
+    project_models,
+    project_setup,
 )
 from .output_policy import (
     ENV_OUTPUT_DIR,
@@ -57,6 +62,7 @@ from .run_service import (
     normalize_run_plan as _service_normalize_run_plan,
 )
 from .run_store import LeaseFenceLost, RunLeaseConflict, RunStore
+from .setup_check import inspect_gemini_setup
 from .worker import (
     inspect_run_liveness as _worker_inspect_run_liveness,
     run_worker_from_dir as _run_worker_runtime,
@@ -67,7 +73,7 @@ from .worker import (
 
 
 SERVER_NAME = "gemini-offload"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 
 
 def _raise_mcp_error(code: int, message: str, data: Any = None) -> None:
@@ -233,9 +239,13 @@ def _compact_success_job_result(
 def _result_receipt_text(structured_content: dict[str, Any], *, is_error: bool) -> str:
     if is_error:
         return "Tool call failed. See structuredContent for error details."
-    if structured_content.get("lifecycle") == "background":
+    if (
+        structured_content.get("status") == "starting"
+        and "run_id" in structured_content
+        and "run_dir" in structured_content
+    ):
         return "Background Gemini run started. Use structuredContent paths and manage_gemini_run for progress."
-    if "item_count" in structured_content and "results" in structured_content:
+    if "results" in structured_content:
         if structured_content.get("read_guidance"):
             return "Gemini run returned in structuredContent. Follow read_guidance before reading output files."
         return "Gemini run returned in structuredContent."
@@ -902,6 +912,19 @@ def _tool_definitions() -> list[mcp_types.Tool]:
             },
         ),
         mcp_types.Tool(
+            name="check_gemini_setup",
+            description="Check local Vertex credential setup status.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            outputSchema={
+                "type": "object",
+                "additionalProperties": True,
+            },
+        ),
+        mcp_types.Tool(
             name="list_gemini_models",
             description="List the Gemini models supported by this server with selection guidance.",
             inputSchema={
@@ -914,14 +937,15 @@ def _tool_definitions() -> list[mcp_types.Tool]:
                 "properties": {
                     "models": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "items": {
+                            "type": "object",
+                            "properties": {"id": {"type": "string"}},
+                            "required": ["id"],
+                            "additionalProperties": True,
+                        },
                     },
-                    "model_characteristics": {
-                        "type": "object",
-                        "additionalProperties": {"type": "string"},
-                    }
                 },
-                "required": ["models", "model_characteristics"],
+                "required": ["models"],
                 "additionalProperties": False,
             },
         ),
@@ -971,19 +995,20 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None):
         if name == "call_gemini":
             plan = _normalize_run_plan(args)
             if plan["lifecycle"] == "background":
-                return _wrap_result(_start_background_run(plan))
-            return _wrap_result(await _execute_run_plan(plan))
+                return _wrap_result(project_background_start(_start_background_run(plan)))
+            return _wrap_result(project_blocking_run(await _execute_run_plan(plan)))
 
         if name == "manage_gemini_run":
             return _wrap_result(_manage_gemini_run(args))
 
+        if name == "check_gemini_setup":
+            result = await anyio.to_thread.run_sync(check_gemini_setup)
+            return _wrap_result(project_setup(result))
+
         if name == "list_gemini_models":
-            return _wrap_result(
-                {
-                    "models": AVAILABLE_MODELS,
-                    "model_characteristics": MODEL_CHARACTERISTICS,
-                }
-            )
+            from .model_registry import MODEL_CAPABILITIES
+
+            return _wrap_result(project_models(MODEL_CAPABILITIES.values()))
 
         if name == "detect_mime":
             result = await anyio.to_thread.run_sync(detect_mime, args["path"])
