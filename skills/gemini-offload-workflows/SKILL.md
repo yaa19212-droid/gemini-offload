@@ -21,7 +21,7 @@ grounded call, then inspect only receipts, status fields, and targeted files.
 6. Default to plain text output. Use JSON schema only when exact fields matter.
 7. Use one `call_gemini` item for a bounded artifact, or multiple items with
    `max_concurrency` for independent artifacts.
-8. Use `execution.lifecycle: "background"` for long OCR/transcription runs.
+8. Use `execution.lifecycle: "background"` for any run or multi-item batch that may take several minutes, including long OCR/transcription, large file-backed prompts, and multi-card synthesis. Do not keep a long batch blocking just because each item has an explicit output path.
 9. Treat `structuredContent` as authoritative. `content[0].text` is only a
    short receipt or read guide.
 
@@ -182,6 +182,7 @@ Grounded short answer:
 - Invalid template placeholders or unused vars are rejected.
 - JSON schema parse failures return `response_json_error` plus text fallback
   fields.
+- Long blocking calls can outlive the surrounding MCP transport even when Gemini has already written some output files. Use background lifecycle for work that may take several minutes; blocking failures are also recorded under `<run_root>/blocking-failures/` for diagnosis.
 - Background worker liveness can be `unknown`; use `manage_gemini_run status`
   before assuming a run is still active.
 - Resume trusts a completed item only after recorded output artifacts pass size

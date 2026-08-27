@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -203,6 +204,73 @@ class RunServiceTests(unittest.TestCase):
             result = anyio.run(scenario)
             self.assertEqual(result["ok_count"], 2)
             self.assertEqual([item["text"] for item in result["results"]], ["one", "two"])
+
+    def test_blocking_failure_diagnostic_unwraps_group_and_preserves_partial_results(self) -> None:
+        class TaskGroupLikeError(RuntimeError):
+            def __init__(self) -> None:
+                super().__init__("task group failed")
+                self.exceptions = (ValueError("inner failure"),)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service = RunService(RunStore(root), root, now=lambda: "2026-08-27T00:00:00+00:00")
+            plan = {
+                "run_id": "run-blocking-failure",
+                "run_dir": None,
+                "lifecycle": "blocking",
+                "max_concurrency": 2,
+                "items": [{"id": "a"}, {"id": "b"}],
+            }
+            results = [
+                {"index": 0, "id": "a", "ok": True, "output_path": "D:/out/a.json", "text": "large output"},
+                None,
+            ]
+
+            path = service.persist_blocking_failure(plan, TaskGroupLikeError(), results)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertEqual(payload["root_error"], {"type": "ValueError", "message": "inner failure"})
+            self.assertEqual(payload["completed_count"], 1)
+            self.assertEqual(payload["results"][0]["output_path"], "D:/out/a.json")
+            self.assertNotIn("text", payload["results"][0])
+            self.assertEqual(payload["exception_tree"]["children"][0]["type"], "ValueError")
+
+    def test_execute_plan_records_unhandled_blocking_task_group_failure(self) -> None:
+        class FatalBatchError(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service = RunService(RunStore(root), root, now=lambda: "2026-08-27T00:00:00+00:00")
+            plan = {
+                "run_id": "run-blocking-fatal",
+                "run_dir": None,
+                "lifecycle": "blocking",
+                "max_concurrency": 1,
+                "items": [{"id": "a", "index": 0, "request": {"output_path": None}}],
+            }
+
+            async def generate(_request):
+                raise FatalBatchError("transport canceled")
+
+            async def scenario():
+                return await service.execute_plan(
+                    plan,
+                    generate=generate,
+                    apply_output=lambda *_args: {},
+                    aggregate=lambda summary, _raw: summary,
+                    ensure_owner=lambda *_args: None,
+                    control_action=lambda _path: None,
+                )
+
+            with self.assertRaises(BaseException):  # noqa: B017 - exercise AnyIO BaseExceptionGroup path
+                anyio.run(scenario)
+
+            diagnostic_path = root / "blocking-failures" / "run-blocking-fatal.json"
+            self.assertTrue(diagnostic_path.exists())
+            payload = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["root_error"]["type"], "FatalBatchError")
+            self.assertIn("transport canceled", payload["root_error"]["message"])
 
     def test_tampered_completed_artifact_is_reexecuted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

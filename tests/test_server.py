@@ -171,6 +171,9 @@ class ServerOutputTests(unittest.TestCase):
         self.assertIn("items", schema["properties"])
         self.assertIn("template_path", schema["properties"])
         self.assertIn("execution", schema["properties"])
+        lifecycle = schema["properties"]["execution"]["properties"]["lifecycle"]
+        self.assertIn("Prefer background", lifecycle["description"])
+        self.assertIn("prefer `background`", call_gemini.description)
         item_properties = schema["properties"]["items"]["items"]["properties"]
         self.assertIn("request", item_properties)
         self.assertIn("vars", item_properties)
@@ -183,6 +186,41 @@ class ServerOutputTests(unittest.TestCase):
             return False
 
         self.assertFalse(contains_one_of(schema))
+
+    def test_internal_error_unwraps_task_group_and_returns_diagnostic_path(self) -> None:
+        server = _load_server_module()
+
+        class TaskGroupLikeError(RuntimeError):
+            def __init__(self) -> None:
+                super().__init__("task group failed")
+                self.exceptions = (ValueError("inner failure"),)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_root = Path(temp_dir)
+
+            async def fail_execute(plan, **_kwargs):
+                diagnostic = run_root / "blocking-failures" / f"{plan['run_id']}.json"
+                diagnostic.parent.mkdir(parents=True, exist_ok=True)
+                diagnostic.write_text("{}", encoding="utf-8")
+                raise TaskGroupLikeError()
+
+            async def scenario():
+                with (
+                    patch.dict(os.environ, {server.ENV_RUN_DIR: temp_dir}, clear=False),
+                    patch.object(server, "_execute_run_plan", fail_execute),
+                ):
+                    await server.handle_call_tool(
+                        "call_gemini",
+                        {"items": [_text_item("a", "one")]},
+                    )
+
+            with self.assertRaises(Exception) as raised:
+                anyio.run(scenario)
+
+            error_data = raised.exception.error_data
+            self.assertEqual(error_data.code, -32603)
+            self.assertEqual(error_data.message, "ValueError: inner failure")
+            self.assertEqual(Path(error_data.data["diagnostic_path"]).parent, run_root / "blocking-failures")
 
     def test_call_gemini_tool_schema_includes_rate_limit_tools_and_json_output(self) -> None:
         server = _load_server_module()

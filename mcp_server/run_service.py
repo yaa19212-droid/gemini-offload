@@ -4,13 +4,19 @@ import datetime
 import json
 import pathlib
 import re
+import traceback
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import anyio
 
-from .artifacts import collect_item_artifacts, managed_output_path, verify_recorded_artifacts
+from .artifacts import (
+    atomic_write_text,
+    collect_item_artifacts,
+    managed_output_path,
+    verify_recorded_artifacts,
+)
 from .gemini_client import (
     DEFAULT_MODEL_NAME,
     DEFAULT_RATE_LIMIT_MAX_WAIT_SECONDS,
@@ -42,6 +48,30 @@ def _root_failure(exc: BaseException) -> BaseException:
         if not isinstance(child, BaseException):
             return current
         current = child
+
+
+def _exception_tree(exc: BaseException) -> dict[str, Any]:
+    nested = getattr(exc, "exceptions", None)
+    children = []
+    if isinstance(nested, (tuple, list)):
+        children = [_exception_tree(child) for child in nested if isinstance(child, BaseException)]
+    payload: dict[str, Any] = {
+        "type": type(exc).__name__,
+        "message": str(exc),
+    }
+    if children:
+        payload["children"] = children
+    return payload
+
+
+def _compact_failure_result(result: dict[str, Any] | None) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    keep = (
+        "index", "id", "ok", "status", "output_path", "char_count", "byte_count",
+        "line_count", "image_count", "error", "error_type",
+    )
+    return {key: result[key] for key in keep if key in result}
 
 
 async def generate_raw_from_request(request: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -145,6 +175,35 @@ class RunService:
             error_type=type(root).__name__,
             message=str(root),
         )
+
+    def persist_blocking_failure(
+        self,
+        plan: dict[str, Any],
+        exc: BaseException,
+        results: list[dict[str, Any] | None],
+    ) -> pathlib.Path:
+        root = _root_failure(exc)
+        diagnostics_dir = self.run_root / "blocking-failures"
+        diagnostic_path = diagnostics_dir / f"{plan['run_id']}.json"
+        payload = {
+            "run_id": plan["run_id"],
+            "lifecycle": "blocking",
+            "failed_at": self.now(),
+            "item_count": len(plan["items"]),
+            "completed_count": sum(result is not None for result in results),
+            "results": [_compact_failure_result(result) for result in results],
+            "root_error": {
+                "type": type(root).__name__,
+                "message": str(root),
+            },
+            "exception_tree": _exception_tree(exc),
+            "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+        }
+        atomic_write_text(
+            diagnostic_path,
+            json.dumps(payload, ensure_ascii=False, indent=2),
+        )
+        return diagnostic_path
 
     def status(self, run_id: str) -> dict[str, Any] | None:
         return self.store.read_run_snapshot(run_id)
@@ -664,9 +723,14 @@ class RunService:
                         },
                     )
 
-        async with anyio.create_task_group() as task_group:
-            for index, item in enumerate(plan["items"]):
-                task_group.start_soon(run_item, index, item)
+        try:
+            async with anyio.create_task_group() as task_group:
+                for index, item in enumerate(plan["items"]):
+                    task_group.start_soon(run_item, index, item)
+        except BaseException as exc:
+            if not background:
+                self.persist_blocking_failure(plan, exc, results)
+            raise
 
         finalized = [result for result in results if result is not None]
         ok_count = sum(1 for result in finalized if result.get("ok") is True)

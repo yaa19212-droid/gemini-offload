@@ -57,6 +57,7 @@ from .output_policy import (
 from .run_service import (
     RunService,
     WorkerOwnershipLost,
+    _root_failure as _service_root_failure,
     load_json_schema as _service_load_json_schema,
     normalize_request as _service_normalize_request,
     normalize_run_plan as _service_normalize_run_plan,
@@ -576,7 +577,16 @@ def _call_gemini_input_schema() -> dict[str, Any]:
     execution_schema = {
         "type": "object",
         "properties": {
-            "lifecycle": {"type": "string", "enum": ["blocking", "background"], "default": "blocking"},
+            "lifecycle": {
+                "type": "string",
+                "enum": ["blocking", "background"],
+                "default": "blocking",
+                "description": (
+                    "Use blocking only for bounded short runs. Prefer background for multi-item "
+                    "or file-backed work that may take several minutes so transport lifetime does "
+                    "not determine run success."
+                ),
+            },
             "max_concurrency": {
                 "type": "integer",
                 "description": f"Maximum concurrent items, capped at {MAX_BATCH_CONCURRENCY}.",
@@ -883,9 +893,10 @@ def _tool_definitions() -> list[mcp_types.Tool]:
             name="call_gemini",
             description=(
                 "Run one or more Gemini request items using explicit request envelopes or a "
-                "template plus per-item vars. Set execution.lifecycle to `blocking` for an "
-                "inline/spill result or `background` to start a child worker process and return "
-                "run paths immediately. Tool content text is a short receipt; use structuredContent."
+                "template plus per-item vars. Use `blocking` only for bounded short work; prefer "
+                "`background` for multi-item or file-backed runs that may take several minutes, "
+                "then inspect them with manage_gemini_run. Tool content text is a short receipt; "
+                "use structuredContent."
             ),
             inputSchema=_call_gemini_input_schema(),
             outputSchema=_run_output_schema(),
@@ -990,6 +1001,7 @@ async def handle_list_tools() -> list[mcp_types.Tool]:
 
 async def handle_call_tool(name: str, arguments: dict[str, Any] | None):
     args = arguments or {}
+    plan: dict[str, Any] | None = None
 
     try:
         if name == "call_gemini":
@@ -1019,7 +1031,17 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None):
     except GeminiRateLimitError as exc:
         return _wrap_result(exc.to_dict(), is_error=True)
     except Exception as exc:
-        _raise_mcp_error(mcp_types.INTERNAL_ERROR, f"{type(exc).__name__}: {exc}")
+        root = _service_root_failure(exc)
+        data = None
+        if plan is not None and plan.get("lifecycle") == "blocking":
+            diagnostic_path = _resolve_run_root() / "blocking-failures" / f"{plan['run_id']}.json"
+            if diagnostic_path.exists():
+                data = {"diagnostic_path": str(diagnostic_path)}
+        _raise_mcp_error(
+            mcp_types.INTERNAL_ERROR,
+            f"{type(root).__name__}: {root}",
+            data=data,
+        )
 
     _raise_mcp_error(mcp_types.INVALID_PARAMS, f"Unknown tool: {name}")
 

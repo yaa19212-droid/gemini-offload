@@ -7,8 +7,8 @@ repeated extraction.
 ## Execution Model
 
 - A run always has one or more items.
-- `execution.lifecycle: "blocking"` waits for all items.
-- `execution.lifecycle: "background"` starts a child worker and returns paths.
+- `execution.lifecycle: "blocking"` waits for all items and is intended for bounded short runs.
+- `execution.lifecycle: "background"` starts a child worker and returns paths. Prefer it whenever a batch may run for several minutes or has enough long items that transport lifetime is uncertain.
 - Items run concurrently up to `execution.max_concurrency`.
 - The old `gemini_generate_batch` tool is intentionally replaced.
 
